@@ -103,64 +103,67 @@ app.post('/run-task', async (req, res) => {
   }
 
   // ----- Advanced: EXTRACT-PHONE -----
-  if (task === 'extract-phone') {
-    if (!url) return res.status(400).json({ error: 'url is required' });
+if (task === 'extract-phone') {
+  if (!url) return res.status(400).json({ error: 'url is required' });
 
-    const browser = await chromium.launch({ headless: true });
-    let context;
-    try {
-      const hasState = fs.existsSync(STATE_PATH);
-      context = hasState
-        ? await browser.newContext({ storageState: STATE_PATH })
-        : await browser.newContext();
+  const browser = await chromium.launch({ headless: true });
+  let context;
+  try {
+    const hasState = fs.existsSync(STATE_PATH);
+    context = hasState
+      ? await browser.newContext({ storageState: STATE_PATH })
+      : await browser.newContext();
 
-      const page = await context.newPage();
+    const page = await context.newPage();
 
-      const cookies = await context.cookies();
-      const hasGoogleCookie = cookies.some(c => c.domain.includes('google'));
-      log('hasState', hasState, 'hasGoogleCookie', hasGoogleCookie);
+    const cookies = await context.cookies();
+    const hasGoogleCookie = cookies.some(c => c.domain.includes('google'));
+    log('hasState', hasState, 'hasGoogleCookie', hasGoogleCookie);
 
-      if (!hasGoogleCookie && GUSER && GPASS && !hasState) {
-        log('Attempting fallback login...');
-        await loginGoogle(page);
-        await context.storageState({ path: STATE_PATH });
-        log('Login complete; state saved');
-      }
-
-      log('goto', url);
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-      await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
-
-      const text = await page.evaluate(() => document.body?.innerText || '');
-      const match = text.match(UK_PHONE_REGEX);
-      const phone = match ? match[0] : null; // return raw match, no conversion
-      log('extracted phone:', phone);
-
-      const result = { ok: !!phone, phone, sourceUrl: url };
-
-      const endpoint = callbackUrl || CALLBACK_URL;
-      if (endpoint) {
-        try {
-          await fetch(endpoint, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(result)
-          });
-          log('callback posted to', endpoint);
-        } catch (e) {
-          log('WARN(callback failed):', e.message);
-        }
-      }
-
-      return res.json(result);
-    } catch (err) {
-      log('ERROR(extract-phone):', err.message);
-      return res.status(500).json({ error: err.message, where: 'extract-phone' });
-    } finally {
-      try { if (context) await context.close(); } catch {}
-      await browser.close();
+    if (!hasGoogleCookie && GUSER && GPASS && !hasState) {
+      log('Attempting fallback login...');
+      await loginGoogle(page);
+      await context.storageState({ path: STATE_PATH });
+      log('Login complete; state saved');
     }
+
+    log('goto', url);
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+
+    const text = await page.evaluate(() => document.body?.innerText || '');
+    const match = text.match(UK_PHONE_REGEX);
+
+    // If no match, return "Required"
+    const phone = match ? match[0] : "Required";
+    log('extracted phone:', phone);
+
+    const result = { ok: phone !== "Required", phone, sourceUrl: url };
+
+    const endpoint = callbackUrl || CALLBACK_URL;
+    if (endpoint) {
+      try {
+        await fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(result)
+        });
+        log('callback posted to', endpoint);
+      } catch (e) {
+        log('WARN(callback failed):', e.message);
+      }
+    }
+
+    return res.json(result);
+  } catch (err) {
+    log('ERROR(extract-phone):', err.message);
+    return res.status(500).json({ error: err.message, where: 'extract-phone' });
+  } finally {
+    try { if (context) await context.close(); } catch {}
+    await browser.close();
   }
+}
+
 
   return res.status(400).json({ error: `Unsupported task: ${task}` });
 });
