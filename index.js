@@ -4,25 +4,27 @@ const { chromium } = require('playwright');
 const app = express();
 app.use(express.json());
 
-const API_TOKEN = 'Fudg3Acc0unt#!'; // 🔐 Change this to your own password
+// use env var for token
+const API_TOKEN = process.env.API_TOKEN;
 
 app.post('/run-task', async (req, res) => {
   const token = req.headers.authorization?.split(' ')[1];
-  if (token !== API_TOKEN) {
+  if (!API_TOKEN || token !== API_TOKEN) {
     return res.status(403).json({ error: 'Not allowed' });
   }
 
   const { url, task } = req.body;
+  if (!url || !task) return res.status(400).json({ error: 'url and task are required' });
 
   try {
-    const browser = await chromium.launch();
+    const browser = await chromium.launch({ headless: true });
     const page = await browser.newPage();
-    await page.goto(url);
+    await page.goto(url, { waitUntil: 'domcontentloaded' });
 
     if (task === 'screenshot') {
       await page.screenshot({ path: 'screenshot.png', fullPage: true });
       await browser.close();
-      return res.json({ message: 'Screenshot saved!' });
+      return res.json({ message: 'Screenshot saved', file: 'screenshot.png' });
     }
 
     if (task === 'title') {
@@ -32,12 +34,12 @@ app.post('/run-task', async (req, res) => {
     }
 
     await browser.close();
-    res.json({ message: 'Done, but task unknown' });
+    return res.status(400).json({ error: `Unsupported task: ${task}` });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: err.message });
   }
 });
 
-app.listen(3000, () => {
-  console.log('🚀 Server running at http://localhost:3000');
-});
+// use the platform’s port when deployed
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));

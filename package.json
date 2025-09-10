@@ -14,3 +14,9 @@
     "playwright": "^1.55.0"
   }
 }
+{
+  "scripts": {
+    "start": "node index.js",
+    "postinstall": "npx playwright install --with-deps"
+  }
+}
