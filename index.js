@@ -9,7 +9,7 @@ const API_TOKEN = process.env.API_TOKEN;
 // Health check
 app.get('/', (_, res) => res.send('OK'));
 
-// Playwright task route
+// ✅ POST /run-task (not GET)
 app.post('/run-task', async (req, res) => {
   const token = req.headers.authorization?.split(' ')[1];
   if (!API_TOKEN || token !== API_TOKEN) {
@@ -33,7 +33,7 @@ app.post('/run-task', async (req, res) => {
     if (task === 'screenshot') {
       await page.screenshot({ path: 'screenshot.png', fullPage: true });
       await browser.close();
-      return res.json({ message: 'Screenshot saved' });
+      return res.json({ message: 'Screenshot saved', file: 'screenshot.png' });
     }
 
     await browser.close();
@@ -43,6 +43,5 @@ app.post('/run-task', async (req, res) => {
   }
 });
 
-// Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
