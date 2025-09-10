@@ -4,12 +4,12 @@ const { chromium } = require('playwright');
 const app = express();
 app.use(express.json());
 
-// use env var for token
 const API_TOKEN = process.env.API_TOKEN;
 
-// 👉 Add this health check route
+// Health check
 app.get('/', (_, res) => res.send('OK'));
 
+// Playwright task route
 app.post('/run-task', async (req, res) => {
   const token = req.headers.authorization?.split(' ')[1];
   if (!API_TOKEN || token !== API_TOKEN) {
@@ -24,16 +24,16 @@ app.post('/run-task', async (req, res) => {
     const page = await browser.newPage();
     await page.goto(url, { waitUntil: 'domcontentloaded' });
 
-    if (task === 'screenshot') {
-      await page.screenshot({ path: 'screenshot.png', fullPage: true });
-      await browser.close();
-      return res.json({ message: 'Screenshot saved', file: 'screenshot.png' });
-    }
-
     if (task === 'title') {
       const title = await page.title();
       await browser.close();
       return res.json({ title });
+    }
+
+    if (task === 'screenshot') {
+      await page.screenshot({ path: 'screenshot.png', fullPage: true });
+      await browser.close();
+      return res.json({ message: 'Screenshot saved' });
     }
 
     await browser.close();
@@ -43,6 +43,6 @@ app.post('/run-task', async (req, res) => {
   }
 });
 
-// use the platform’s port when deployed
+// Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
