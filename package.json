@@ -3,20 +3,15 @@
   "version": "1.0.0",
   "description": "",
   "main": "index.js",
+  "license": "MIT",
+  "engines": { "node": ">=18" },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node index.js",
+    "postinstall": "npx playwright install --with-deps",
+    "test": "echo \"No tests specified\" && exit 0"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
   "dependencies": {
     "express": "^5.1.0",
     "playwright": "^1.55.0"
-  }
-}
-{
-  "scripts": {
-    "start": "node index.js",
-    "postinstall": "npx playwright install --with-deps"
   }
 }
