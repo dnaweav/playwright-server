@@ -7,7 +7,6 @@
   "engines": { "node": ">=18" },
   "scripts": {
     "start": "node index.js",
-    "postinstall": "npx playwright install --with-deps",
     "test": "echo \"No tests specified\" && exit 0"
   },
   "dependencies": {
