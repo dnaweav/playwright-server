@@ -7,6 +7,9 @@ app.use(express.json());
 // use env var for token
 const API_TOKEN = process.env.API_TOKEN;
 
+// 👉 Add this health check route
+app.get('/', (_, res) => res.send('OK'));
+
 app.post('/run-task', async (req, res) => {
   const token = req.headers.authorization?.split(' ')[1];
   if (!API_TOKEN || token !== API_TOKEN) {
