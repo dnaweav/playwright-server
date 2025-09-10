@@ -1,7 +1,6 @@
 // index.js
 // Playwright MCP-style micro-API for Make.com
 
-// Optional .env (Railway uses env vars automatically)
 try { require('dotenv').config(); } catch {}
 
 const express = require('express');
@@ -13,12 +12,12 @@ app.use(express.json());
 
 // ---------- Config ----------
 const API_TOKEN     = process.env.API_TOKEN;             // required Auth bearer
-const GUSER         = process.env.GOOGLE_USER || "";     // optional; see notes
-const GPASS         = process.env.GOOGLE_PASS || "";     // optional; see notes
-const CALLBACK_URL  = process.env.CALLBACK_URL || "";    // optional Make webhook
-const STATE_PATH    = '/tmp/google-state.json';          // persisted Google session
+const GUSER         = process.env.GOOGLE_USER || "";     // optional fallback
+const GPASS         = process.env.GOOGLE_PASS || "";
+const CALLBACK_URL  = process.env.CALLBACK_URL || "";
+const STATE_PATH    = '/tmp/google-state.json';
 
-// Seed storage state from env on boot (best way to avoid Google challenges)
+// Seed storage state from env (recommended)
 try {
   if (process.env.GOOGLE_STATE_B64 && !fs.existsSync(STATE_PATH)) {
     fs.writeFileSync(STATE_PATH, Buffer.from(process.env.GOOGLE_STATE_B64, 'base64'));
@@ -29,20 +28,10 @@ try {
 }
 
 // ---------- Helpers ----------
+// Match UK mobiles, local landlines, or +44 numbers
 const UK_PHONE_REGEX =
-  /(\+44\s?7\d{3}\s?\d{6}|07\d{3}\s?\d{6}|0\d{3}\s?\d{3}\s?\d{4}|\+44\s?0?\d{10})/;
+  /\b(?:\+44\s?\d{9,10}|07\d{9}|01\d{8,9}|02\d{8,9})\b/;
 
-function normalizePhone(raw) {
-  if (!raw) return null;
-  const digits = raw.replace(/[^\d+]/g, '');
-  if (digits.startsWith('+44')) return digits;
-  if (digits.startsWith('07')) return '+44' + digits.slice(1);
-  if (digits.startsWith('0044')) return '+' + digits.slice(2);
-  return raw;
-}
-
-// Fallback login (only used if no storage state and creds provided)
-// Note: Google may still challenge headless/automation; prefer storage state.
 async function loginGoogle(page) {
   await page.goto('https://accounts.google.com/', { waitUntil: 'domcontentloaded' });
 
@@ -64,7 +53,7 @@ async function loginGoogle(page) {
 }
 
 // ---------- Health ----------
-app.get('/',      (_, res) => res.send('OK'));
+app.get('/', (_, res) => res.send('OK'));
 app.get('/healthz', (_, res) => res.json({ ok: true }));
 
 // ---------- Main endpoint ----------
@@ -127,7 +116,6 @@ app.post('/run-task', async (req, res) => {
 
       const page = await context.newPage();
 
-      // If no Google cookies and creds provided, try fallback login once
       const cookies = await context.cookies();
       const hasGoogleCookie = cookies.some(c => c.domain.includes('google'));
       log('hasState', hasState, 'hasGoogleCookie', hasGoogleCookie);
@@ -135,7 +123,7 @@ app.post('/run-task', async (req, res) => {
       if (!hasGoogleCookie && GUSER && GPASS && !hasState) {
         log('Attempting fallback login...');
         await loginGoogle(page);
-        await context.storageState({ path: STATE_PATH }); // cache for future
+        await context.storageState({ path: STATE_PATH });
         log('Login complete; state saved');
       }
 
@@ -145,12 +133,11 @@ app.post('/run-task', async (req, res) => {
 
       const text = await page.evaluate(() => document.body?.innerText || '');
       const match = text.match(UK_PHONE_REGEX);
-      const phone = normalizePhone(match ? match[0] : null);
+      const phone = match ? match[0] : null; // return raw match, no conversion
       log('extracted phone:', phone);
 
       const result = { ok: !!phone, phone, sourceUrl: url };
 
-      // Optional callback to Make.com webhook
       const endpoint = callbackUrl || CALLBACK_URL;
       if (endpoint) {
         try {
