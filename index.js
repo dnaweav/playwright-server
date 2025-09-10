@@ -28,9 +28,12 @@ try {
 }
 
 // ---------- Helpers ----------
-// Match UK mobiles, local landlines, or +44 numbers
-const UK_PHONE_REGEX =
-  /\b(?:\+44\s?\d{9,10}|07\d{9}|01\d{8,9}|02\d{8,9})\b/;
+// Match UK numbers with optional spaces/hyphens and return raw text
+// - +44 followed by 9–10 digits (e.g. +44 20 7123 4567, +447796980202)
+// - Mobiles 07xxxxxxxxx (allow spaces/hyphens)
+// - Landlines starting 01 or 02 (allow spaces/hyphens)
+const UK_PHONE_REGEX_GLOBAL =
+  /\b(?:\+44\s?\d(?:[\s-]?\d){8,9}|07(?:[\s-]?\d){9}|0[12](?:[\s-]?\d){8,9})\b/g;
 
 async function loginGoogle(page) {
   await page.goto('https://accounts.google.com/', { waitUntil: 'domcontentloaded' });
@@ -132,10 +135,10 @@ if (task === 'extract-phone') {
     await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
 
     const text = await page.evaluate(() => document.body?.innerText || '');
-    const match = text.match(UK_PHONE_REGEX);
+    // Get ALL matches in natural text order, then take the first
+    const matches = text.match(UK_PHONE_REGEX_GLOBAL) || [];
+    const phone = matches[0] || "Required";
 
-    // If no match, return "Required"
-    const phone = match ? match[0] : "Required";
     log('extracted phone:', phone);
 
     const result = { ok: phone !== "Required", phone, sourceUrl: url };
