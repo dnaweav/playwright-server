@@ -60,9 +60,8 @@ async function loginGoogle(page) {
 app.get('/', (_, res) => res.send('OK'));
 app.get('/healthz', (_, res) => res.json({ ok: true }));
 
-// --- Main task endpoint ---
 app.post('/run-task', async (req, res) => {
-  // Auth
+  const startAt = Date.now();
   const token = req.headers.authorization?.split(' ')[1] || '';
   if (!API_TOKEN || token !== API_TOKEN) {
     return res.status(403).json({ error: 'Not allowed' });
@@ -71,91 +70,97 @@ app.post('/run-task', async (req, res) => {
   const { task, url, callbackUrl } = req.body || {};
   if (!task) return res.status(400).json({ error: 'task is required' });
 
-  // Simple tasks (no login)
-  if (task === 'title') {
-    if (!url) return res.status(400).json({ error: 'url is required' });
-    const browser = await chromium.launch({ headless: true });
-    try {
-      const page = await browser.newPage();
-      await page.goto(url, { waitUntil: 'domcontentloaded' });
-      const title = await page.title();
-      return res.json({ title, sourceUrl: url });
-    } catch (err) {
-      return res.status(500).json({ error: err.message });
-    } finally {
-      await browser.close();
-    }
-  }
+  const log = (...args) => console.log(`[run-task][${task}]`, ...args);
 
-  if (task === 'screenshot') {
+  // --- simple tasks ---
+  if (task === 'title' || task === 'screenshot') {
     if (!url) return res.status(400).json({ error: 'url is required' });
     const browser = await chromium.launch({ headless: true });
     try {
       const page = await browser.newPage();
-      await page.goto(url, { waitUntil: 'domcontentloaded' });
+      log('goto', url);
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+
+      if (task === 'title') {
+        const title = await page.title();
+        log('title:', title);
+        return res.json({ title, sourceUrl: url, ms: Date.now() - startAt });
+      }
+
       await page.screenshot({ path: 'screenshot.png', fullPage: true });
-      return res.json({ message: 'Screenshot saved', file: 'screenshot.png', sourceUrl: url });
+      log('screenshot saved');
+      return res.json({ message: 'Screenshot saved', file: 'screenshot.png', sourceUrl: url, ms: Date.now() - startAt });
     } catch (err) {
-      return res.status(500).json({ error: err.message });
+      log('ERROR(simple):', err.message);
+      return res.status(500).json({ error: err.message, where: 'simple' });
     } finally {
       await browser.close();
     }
   }
 
-  // Advanced: extract-phone (requires Google session in many cases)
+  // --- extract-phone ---
   if (task === 'extract-phone') {
     if (!url) return res.status(400).json({ error: 'url is required' });
 
     const browser = await chromium.launch({ headless: true });
     let context;
     try {
-      // Use persisted session if present
-      if (fs.existsSync(STATE_PATH)) {
-        context = await browser.newContext({ storageState: STATE_PATH });
-      } else {
-        context = await browser.newContext();
-      }
+      // storage state guard
+      const statePath = '/tmp/google-state.json';
+      const hasState = fs.existsSync(statePath);
+      context = hasState
+        ? await browser.newContext({ storageState: statePath })
+        : await browser.newContext();
 
       const page = await context.newPage();
 
-      // Determine if we need to log in (cookie presence heuristic)
+      // see if we’re logged in already
       const cookies = await context.cookies();
       const hasGoogleCookie = cookies.some(c => c.domain.includes('google'));
+      log('hasState', hasState, 'hasGoogleCookie', hasGoogleCookie);
 
       if (!hasGoogleCookie && GUSER && GPASS) {
-        await loginGoogle(page);
-        // Save session for next runs
-        await context.storageState({ path: STATE_PATH });
+        log('logging in to Google...');
+        try {
+          await loginGoogle(page);
+          await context.storageState({ path: statePath });
+          log('login complete; state saved');
+        } catch (e) {
+          log('ERROR(login):', e.message);
+          return res.status(500).json({ error: `login failed: ${e.message}` });
+        }
       }
 
-      // Go to the lead URL (c.gle will redirect to the Google page you saw)
-      await page.goto(url, { waitUntil: 'domcontentloaded' });
+      log('goto lead', url);
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
       await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
 
-      // Extract phone number from whole page text (robust fallback)
-      const fullText = await page.evaluate(() => document.body?.innerText || '');
-      const match = fullText.match(UK_PHONE_REGEX);
-      const phone = normalizePhone(match ? match[0] : null);
+      const text = await page.evaluate(() => document.body?.innerText || '');
+      const m = text.match(/(\+44\s?7\d{3}\s?\d{6}|07\d{3}\s?\d{6}|0\d{3}\s?\d{3}\s?\d{4}|\+44\s?0?\d{10})/);
+      const phone = normalizePhone(m ? m[0] : null);
+      log('extracted phone:', phone);
 
-      const result = { ok: !!phone, phone, sourceUrl: url };
+      const result = { ok: !!phone, phone, sourceUrl: url, ms: Date.now() - startAt };
 
-      // Optional callback to Make.com webhook
-      const endpoint = callbackUrl || CALLBACK_URL;
+      // optional callback
+      const endpoint = callbackUrl || process.env.CALLBACK_URL;
       if (endpoint) {
         try {
           await fetch(endpoint, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(result)
+            body: JSON.stringify(result),
           });
-        } catch {
-          // non-fatal if callback fails; still return result
+          log('callback posted to', endpoint);
+        } catch (e) {
+          log('WARN(callback failed):', e.message);
         }
       }
 
       return res.json(result);
     } catch (err) {
-      return res.status(500).json({ error: err.message });
+      log('ERROR(extract-phone):', err.message);
+      return res.status(500).json({ error: err.message, where: 'extract-phone' });
     } finally {
       try { if (context) await context.close(); } catch {}
       await browser.close();
@@ -164,6 +169,7 @@ app.post('/run-task', async (req, res) => {
 
   return res.status(400).json({ error: `Unsupported task: ${task}` });
 });
+
 
 // --- Start server ---
 const PORT = process.env.PORT || 3000;
