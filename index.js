@@ -155,7 +155,14 @@ app.post('/run-task', async (req, res) => {
       await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {});
       await page.waitForTimeout(1000); // give SPA a moment to hydrate
 
-      const phone = (await findFirstPhoneOnPage(page, 15000)) || "Required";
+      // First check for "No phone number"
+      const bodyText = await page.evaluate(() => document.body?.innerText || '');
+      let phone = "Required";
+
+      if (!/no phone number/i.test(bodyText)) {
+        phone = (await findFirstPhoneOnPage(page, 15000)) || "Required";
+      }
+
       log('extracted phone:', phone);
 
       const result = { ok: phone !== "Required", phone, sourceUrl: url };
