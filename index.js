@@ -29,19 +29,25 @@ try {
 
 // ---------- Helpers ----------
 
-// Accept +44, 07…, 01…, 02… with optional spaces/hyphens; global for all matches in page-order
+// Accept +44, 07…, 01…, 02… with optional spaces/hyphens; global for all matches in order
 const UK_PHONE_REGEX_GLOBAL =
   /\b(?:\+44\s?\d(?:[\s-]?\d){8,9}|07(?:[\s-]?\d){9}|0[12](?:[\s-]?\d){8,9})\b/g;
 
-// Simple email regex that avoids most false-positives and works with WIZ JSON text
+// Very permissive e-mail, then we will filter out service domains.
+// (Simple & robust for scraping; avoids catastrophic backtracking.)
 const EMAIL_REGEX_GLOBAL =
-  /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi;
+  /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g;
 
-// Obvious non-lead domains to ignore when scraping from Google HTML/JS
-const EMAIL_DOMAIN_BLOCKLIST = new Set([
-  'google.com', 'gstatic.com', 'googletagmanager.com', 'gmail.com' // keep gmail? -> many leads use it; remove if you want to allow Gmail
-]);
-// If you want to allow Gmail leads, delete 'gmail.com' above.
+// Known non-lead/system domains to ignore
+const SERVICE_EMAIL_DOMAINS = [
+  'google.com', 'gstatic.com', 'googlemail.com', 'corp.google.com',
+  'adwords.corp.google.com', 'awx-sab-debug.corp.google.com'
+];
+
+function isServiceEmail(email) {
+  const domain = email.split('@')[1]?.toLowerCase() || '';
+  return SERVICE_EMAIL_DOMAINS.some(d => domain.endsWith(d));
+}
 
 // Fallback scripted login (avoid when possible—prefer storage state)
 async function loginGoogle(page) {
@@ -64,19 +70,19 @@ async function loginGoogle(page) {
   ]);
 }
 
-// Return the first phone number on the page (DOM first, then HTML source)
+// Poll the rendered DOM first; if no match, scan HTML source (good for SPA/WIZ JSON)
 async function findFirstPhoneOnPage(page, timeoutMs = 15000) {
   const deadline = Date.now() + timeoutMs;
 
-  // 1) Poll rendered text (keeps the "first seen" rule)
+  // 1) Poll rendered text
   while (Date.now() < deadline) {
     const text = await page.evaluate(() => document.body?.innerText || '');
     const matches = text.match(UK_PHONE_REGEX_GLOBAL) || [];
-    if (matches.length) return matches[0];
+    if (matches.length) return matches[0]; // first in natural order
     await page.waitForTimeout(500);
   }
 
-  // 2) Fallback: HTML source (captures numbers embedded in WIZ JSON)
+  // 2) Fallback: HTML source
   const html = await page.content();
   const srcMatches = html.match(UK_PHONE_REGEX_GLOBAL) || [];
   if (srcMatches.length) return srcMatches[0];
@@ -84,35 +90,21 @@ async function findFirstPhoneOnPage(page, timeoutMs = 15000) {
   return null;
 }
 
-// Return the first likely lead email (DOM first, then HTML source), skipping blocked domains
-function pickFirstAllowedEmail(matches) {
-  for (const m of matches) {
-    const email = m.trim();
-    const domain = email.split('@')[1]?.toLowerCase() || '';
-    const root = domain.split(':')[0].split('/')[0]; // strip any oddities
-    const tld = root.split('.').slice(-2).join('.');  // crude eTLD+1 approximation
-    if (!EMAIL_DOMAIN_BLOCKLIST.has(tld)) return email;
-  }
-  return null;
-}
-
 async function findFirstEmailOnPage(page, timeoutMs = 15000) {
   const deadline = Date.now() + timeoutMs;
 
-  // 1) Rendered text first
+  // 1) Poll rendered text (visual ordering)
   while (Date.now() < deadline) {
     const text = await page.evaluate(() => document.body?.innerText || '');
-    const matches = text.match(EMAIL_REGEX_GLOBAL) || [];
-    const chosen = pickFirstAllowedEmail(matches);
-    if (chosen) return chosen;
+    const matches = (text.match(EMAIL_REGEX_GLOBAL) || []).filter(e => !isServiceEmail(e));
+    if (matches.length) return matches[0];
     await page.waitForTimeout(500);
   }
 
-  // 2) HTML source (WIZ JSON etc.)
+  // 2) Fallback: HTML source (captures emails in inline JSON/script)
   const html = await page.content();
-  const srcMatches = html.match(EMAIL_REGEX_GLOBAL) || [];
-  const chosen = pickFirstAllowedEmail(srcMatches);
-  if (chosen) return chosen;
+  const srcMatches = (html.match(EMAIL_REGEX_GLOBAL) || []).filter(e => !isServiceEmail(e));
+  if (srcMatches.length) return srcMatches[0];
 
   return null;
 }
@@ -167,8 +159,10 @@ app.post('/run-task', async (req, res) => {
     }
   }
 
-  // ----- Shared setup for extract-* tasks -----
-  async function withContext(run) {
+  // ----- Advanced: EXTRACT-PHONE -----
+  if (task === 'extract-phone') {
+    if (!url) return res.status(400).json({ error: 'url is required' });
+
     const browser = await chromium.launch({ headless: true });
     let context;
     try {
@@ -196,124 +190,114 @@ app.post('/run-task', async (req, res) => {
       await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {});
       await page.waitForTimeout(1000); // give SPA a moment to hydrate
 
-      return await run(page);
+      // First check for "No phone number"
+      const bodyText = await page.evaluate(() => document.body?.innerText || '');
+      let phone = "Required";
+
+      if (!/no phone number/i.test(bodyText)) {
+        phone = (await findFirstPhoneOnPage(page, 15000)) || "Required";
+      }
+
+      log('extracted phone:', phone);
+
+      const result = { ok: phone !== "Required", phone, sourceUrl: url };
+
+      // Optional callback to Make.com webhook
+      const endpoint = callbackUrl || CALLBACK_URL;
+      if (endpoint) {
+        try {
+          await fetch(endpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(result)
+          });
+          log('callback posted to', endpoint);
+        } catch (e) {
+          log('WARN(callback failed):', e.message);
+        }
+      }
+
+      return res.json(result);
+    } catch (err) {
+      log('ERROR(extract-phone):', err.message);
+      return res.status(500).json({ error: err.message, where: 'extract-phone' });
     } finally {
       try { if (context) await context.close(); } catch {}
       await browser.close();
     }
   }
 
-  // ----- Advanced: EXTRACT-PHONE -----
-  if (task === 'extract-phone') {
-    if (!url) return res.status(400).json({ error: 'url is required' });
-
-    try {
-      const result = await withContext(async (page) => {
-        // If header displays “No phone number”, force Required
-        const bodyText = await page.evaluate(() => document.body?.innerText || '');
-        let phone = "Required";
-        if (!/no phone number/i.test(bodyText)) {
-          phone = (await findFirstPhoneOnPage(page, 15000)) || "Required";
-        }
-
-        const payload = { ok: phone !== "Required", phone, sourceUrl: url };
-
-        // Optional callback to Make.com webhook
-        const endpoint = callbackUrl || CALLBACK_URL;
-        if (endpoint) {
-          try {
-            await fetch(endpoint, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(payload)
-            });
-            log('callback posted to', endpoint);
-          } catch (e) {
-            log('WARN(callback failed):', e.message);
-          }
-        }
-        return payload;
-      });
-      return res.json(result);
-    } catch (err) {
-      log('ERROR(extract-phone):', err.message);
-      return res.status(500).json({ error: err.message, where: 'extract-phone' });
-    }
-  }
-
-  // ----- Advanced: EXTRACT-EMAIL -----
-  if (task === 'extract-email') {
-    if (!url) return res.status(400).json({ error: 'url is required' });
-
-    try {
-      const result = await withContext(async (page) => {
-        const email = (await findFirstEmailOnPage(page, 15000)) || "Required";
-        const payload = { ok: email !== "Required", email, sourceUrl: url };
-
-        const endpoint = callbackUrl || CALLBACK_URL;
-        if (endpoint) {
-          try {
-            await fetch(endpoint, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(payload)
-            });
-            log('callback posted to', endpoint);
-          } catch (e) {
-            log('WARN(callback failed):', e.message);
-          }
-        }
-        return payload;
-      });
-      return res.json(result);
-    } catch (err) {
-      log('ERROR(extract-email):', err.message);
-      return res.status(500).json({ error: err.message, where: 'extract-email' });
-    }
-  }
-
-  // ----- Advanced: EXTRACT-CONTACT (phone + email in one call) -----
+  // ----- Advanced: EXTRACT-CONTACT (phone + email) -----
   if (task === 'extract-contact') {
     if (!url) return res.status(400).json({ error: 'url is required' });
 
+    const browser = await chromium.launch({ headless: true });
+    let context;
     try {
-      const result = await withContext(async (page) => {
-        // Phone (respect "No phone number")
-        const bodyText = await page.evaluate(() => document.body?.innerText || '');
-        let phone = "Required";
-        if (!/no phone number/i.test(bodyText)) {
-          phone = (await findFirstPhoneOnPage(page, 15000)) || "Required";
+      const hasState = fs.existsSync(STATE_PATH);
+      context = hasState
+        ? await browser.newContext({ storageState: STATE_PATH })
+        : await browser.newContext();
+
+      const page = await context.newPage();
+
+      const cookies = await context.cookies();
+      const hasGoogleCookie = cookies.some(c => c.domain.includes('google'));
+      log('hasState', hasState, 'hasGoogleCookie', hasGoogleCookie);
+
+      if (!hasGoogleCookie && GUSER && GPASS && !hasState) {
+        log('Attempting fallback login...');
+        await loginGoogle(page);
+        await context.storageState({ path: STATE_PATH });
+        log('Login complete; state saved');
+      }
+
+      log('goto', url);
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {});
+      await page.waitForTimeout(1000);
+
+      // Phone (with "No phone number" rule)
+      const bodyText = await page.evaluate(() => document.body?.innerText || '');
+      let phone = "Required";
+      if (!/no phone number/i.test(bodyText)) {
+        phone = (await findFirstPhoneOnPage(page, 15000)) || "Required";
+      }
+
+      // Email (first wins, filter out service emails)
+      const email = (await findFirstEmailOnPage(page, 15000)) || "Required";
+
+      log('extracted phone:', phone, '| email:', email);
+
+      const result = {
+        ok: phone !== "Required" || email !== "Required",
+        phone,
+        email,
+        sourceUrl: url
+      };
+
+      // Optional callback to Make.com webhook
+      const endpoint = callbackUrl || CALLBACK_URL;
+      if (endpoint) {
+        try {
+          await fetch(endpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(result)
+          });
+          log('callback posted to', endpoint);
+        } catch (e) {
+          log('WARN(callback failed):', e.message);
         }
+      }
 
-        // Email
-        const email = (await findFirstEmailOnPage(page, 15000)) || "Required";
-
-        const payload = {
-          ok: phone !== "Required" || email !== "Required",
-          phone,
-          email,
-          sourceUrl: url
-        };
-
-        const endpoint = callbackUrl || CALLBACK_URL;
-        if (endpoint) {
-          try {
-            await fetch(endpoint, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(payload)
-            });
-            log('callback posted to', endpoint);
-          } catch (e) {
-            log('WARN(callback failed):', e.message);
-          }
-        }
-        return payload;
-      });
       return res.json(result);
     } catch (err) {
       log('ERROR(extract-contact):', err.message);
       return res.status(500).json({ error: err.message, where: 'extract-contact' });
+    } finally {
+      try { if (context) await context.close(); } catch {}
+      await browser.close();
     }
   }
 
