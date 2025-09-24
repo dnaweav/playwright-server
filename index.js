@@ -29,9 +29,19 @@ try {
 
 // ---------- Helpers ----------
 
-// Accept +44, 07…, 01…, 02… with optional spaces/hyphens; global for all matches in order
+// Accept +44, 07…, 01…, 02… with optional spaces/hyphens; global for all matches in page-order
 const UK_PHONE_REGEX_GLOBAL =
   /\b(?:\+44\s?\d(?:[\s-]?\d){8,9}|07(?:[\s-]?\d){9}|0[12](?:[\s-]?\d){8,9})\b/g;
+
+// Simple email regex that avoids most false-positives and works with WIZ JSON text
+const EMAIL_REGEX_GLOBAL =
+  /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi;
+
+// Obvious non-lead domains to ignore when scraping from Google HTML/JS
+const EMAIL_DOMAIN_BLOCKLIST = new Set([
+  'google.com', 'gstatic.com', 'googletagmanager.com', 'gmail.com' // keep gmail? -> many leads use it; remove if you want to allow Gmail
+]);
+// If you want to allow Gmail leads, delete 'gmail.com' above.
 
 // Fallback scripted login (avoid when possible—prefer storage state)
 async function loginGoogle(page) {
@@ -54,22 +64,55 @@ async function loginGoogle(page) {
   ]);
 }
 
-// Poll the rendered DOM first; if no match, scan HTML source (good for SPA/WIZ JSON)
+// Return the first phone number on the page (DOM first, then HTML source)
 async function findFirstPhoneOnPage(page, timeoutMs = 15000) {
   const deadline = Date.now() + timeoutMs;
 
-  // 1) Poll rendered text
+  // 1) Poll rendered text (keeps the "first seen" rule)
   while (Date.now() < deadline) {
     const text = await page.evaluate(() => document.body?.innerText || '');
     const matches = text.match(UK_PHONE_REGEX_GLOBAL) || [];
-    if (matches.length) return matches[0]; // first in natural order
+    if (matches.length) return matches[0];
     await page.waitForTimeout(500);
   }
 
-  // 2) Fallback: HTML source
+  // 2) Fallback: HTML source (captures numbers embedded in WIZ JSON)
   const html = await page.content();
   const srcMatches = html.match(UK_PHONE_REGEX_GLOBAL) || [];
   if (srcMatches.length) return srcMatches[0];
+
+  return null;
+}
+
+// Return the first likely lead email (DOM first, then HTML source), skipping blocked domains
+function pickFirstAllowedEmail(matches) {
+  for (const m of matches) {
+    const email = m.trim();
+    const domain = email.split('@')[1]?.toLowerCase() || '';
+    const root = domain.split(':')[0].split('/')[0]; // strip any oddities
+    const tld = root.split('.').slice(-2).join('.');  // crude eTLD+1 approximation
+    if (!EMAIL_DOMAIN_BLOCKLIST.has(tld)) return email;
+  }
+  return null;
+}
+
+async function findFirstEmailOnPage(page, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+
+  // 1) Rendered text first
+  while (Date.now() < deadline) {
+    const text = await page.evaluate(() => document.body?.innerText || '');
+    const matches = text.match(EMAIL_REGEX_GLOBAL) || [];
+    const chosen = pickFirstAllowedEmail(matches);
+    if (chosen) return chosen;
+    await page.waitForTimeout(500);
+  }
+
+  // 2) HTML source (WIZ JSON etc.)
+  const html = await page.content();
+  const srcMatches = html.match(EMAIL_REGEX_GLOBAL) || [];
+  const chosen = pickFirstAllowedEmail(srcMatches);
+  if (chosen) return chosen;
 
   return null;
 }
@@ -124,10 +167,8 @@ app.post('/run-task', async (req, res) => {
     }
   }
 
-  // ----- Advanced: EXTRACT-PHONE -----
-  if (task === 'extract-phone') {
-    if (!url) return res.status(400).json({ error: 'url is required' });
-
+  // ----- Shared setup for extract-* tasks -----
+  async function withContext(run) {
     const browser = await chromium.launch({ headless: true });
     let context;
     try {
@@ -155,40 +196,124 @@ app.post('/run-task', async (req, res) => {
       await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {});
       await page.waitForTimeout(1000); // give SPA a moment to hydrate
 
-      // First check for "No phone number"
-      const bodyText = await page.evaluate(() => document.body?.innerText || '');
-      let phone = "Required";
+      return await run(page);
+    } finally {
+      try { if (context) await context.close(); } catch {}
+      await browser.close();
+    }
+  }
 
-      if (!/no phone number/i.test(bodyText)) {
-        phone = (await findFirstPhoneOnPage(page, 15000)) || "Required";
-      }
+  // ----- Advanced: EXTRACT-PHONE -----
+  if (task === 'extract-phone') {
+    if (!url) return res.status(400).json({ error: 'url is required' });
 
-      log('extracted phone:', phone);
-
-      const result = { ok: phone !== "Required", phone, sourceUrl: url };
-
-      // Optional callback to Make.com webhook
-      const endpoint = callbackUrl || CALLBACK_URL;
-      if (endpoint) {
-        try {
-          await fetch(endpoint, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(result)
-          });
-          log('callback posted to', endpoint);
-        } catch (e) {
-          log('WARN(callback failed):', e.message);
+    try {
+      const result = await withContext(async (page) => {
+        // If header displays “No phone number”, force Required
+        const bodyText = await page.evaluate(() => document.body?.innerText || '');
+        let phone = "Required";
+        if (!/no phone number/i.test(bodyText)) {
+          phone = (await findFirstPhoneOnPage(page, 15000)) || "Required";
         }
-      }
 
+        const payload = { ok: phone !== "Required", phone, sourceUrl: url };
+
+        // Optional callback to Make.com webhook
+        const endpoint = callbackUrl || CALLBACK_URL;
+        if (endpoint) {
+          try {
+            await fetch(endpoint, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload)
+            });
+            log('callback posted to', endpoint);
+          } catch (e) {
+            log('WARN(callback failed):', e.message);
+          }
+        }
+        return payload;
+      });
       return res.json(result);
     } catch (err) {
       log('ERROR(extract-phone):', err.message);
       return res.status(500).json({ error: err.message, where: 'extract-phone' });
-    } finally {
-      try { if (context) await context.close(); } catch {}
-      await browser.close();
+    }
+  }
+
+  // ----- Advanced: EXTRACT-EMAIL -----
+  if (task === 'extract-email') {
+    if (!url) return res.status(400).json({ error: 'url is required' });
+
+    try {
+      const result = await withContext(async (page) => {
+        const email = (await findFirstEmailOnPage(page, 15000)) || "Required";
+        const payload = { ok: email !== "Required", email, sourceUrl: url };
+
+        const endpoint = callbackUrl || CALLBACK_URL;
+        if (endpoint) {
+          try {
+            await fetch(endpoint, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload)
+            });
+            log('callback posted to', endpoint);
+          } catch (e) {
+            log('WARN(callback failed):', e.message);
+          }
+        }
+        return payload;
+      });
+      return res.json(result);
+    } catch (err) {
+      log('ERROR(extract-email):', err.message);
+      return res.status(500).json({ error: err.message, where: 'extract-email' });
+    }
+  }
+
+  // ----- Advanced: EXTRACT-CONTACT (phone + email in one call) -----
+  if (task === 'extract-contact') {
+    if (!url) return res.status(400).json({ error: 'url is required' });
+
+    try {
+      const result = await withContext(async (page) => {
+        // Phone (respect "No phone number")
+        const bodyText = await page.evaluate(() => document.body?.innerText || '');
+        let phone = "Required";
+        if (!/no phone number/i.test(bodyText)) {
+          phone = (await findFirstPhoneOnPage(page, 15000)) || "Required";
+        }
+
+        // Email
+        const email = (await findFirstEmailOnPage(page, 15000)) || "Required";
+
+        const payload = {
+          ok: phone !== "Required" || email !== "Required",
+          phone,
+          email,
+          sourceUrl: url
+        };
+
+        const endpoint = callbackUrl || CALLBACK_URL;
+        if (endpoint) {
+          try {
+            await fetch(endpoint, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload)
+            });
+            log('callback posted to', endpoint);
+          } catch (e) {
+            log('WARN(callback failed):', e.message);
+          }
+        }
+        return payload;
+      });
+      return res.json(result);
+    } catch (err) {
+      log('ERROR(extract-contact):', err.message);
+      return res.status(500).json({ error: err.message, where: 'extract-contact' });
     }
   }
 
