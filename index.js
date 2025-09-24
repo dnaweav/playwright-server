@@ -16,6 +16,11 @@ const GUSER         = process.env.GOOGLE_USER || "";     // optional fallback
 const GPASS         = process.env.GOOGLE_PASS || "";     // optional fallback
 const CALLBACK_URL  = process.env.CALLBACK_URL || "";    // optional Make webhook
 const STATE_PATH    = '/tmp/google-state.json';
+// NEW: optional comma-separated list of emails to ignore (in addition to GOOGLE_USER)
+const EXCLUDE_EMAILS = (process.env.EXCLUDE_EMAILS || '')
+  .split(',')
+  .map(s => s.trim().toLowerCase())
+  .filter(Boolean);
 
 // Seed storage state from env on boot (recommended approach for Google)
 try {
@@ -29,12 +34,11 @@ try {
 
 // ---------- Helpers ----------
 
-// Accept +44, 07…, 01…, 02… with optional spaces/hyphens; global for all matches in order
+// Accept +44, 07…, 01…, 02… with optional spaces/hyphens; global for all matches in page-order
 const UK_PHONE_REGEX_GLOBAL =
   /\b(?:\+44\s?\d(?:[\s-]?\d){8,9}|07(?:[\s-]?\d){9}|0[12](?:[\s-]?\d){8,9})\b/g;
 
-// Very permissive e-mail, then we will filter out service domains.
-// (Simple & robust for scraping; avoids catastrophic backtracking.)
+// Email regex (robust enough for scraping; avoids catastrophic backtracking)
 const EMAIL_REGEX_GLOBAL =
   /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g;
 
@@ -47,6 +51,39 @@ const SERVICE_EMAIL_DOMAINS = [
 function isServiceEmail(email) {
   const domain = email.split('@')[1]?.toLowerCase() || '';
   return SERVICE_EMAIL_DOMAINS.some(d => domain.endsWith(d));
+}
+
+function isExcludedEmail(email) {
+  const e = (email || '').toLowerCase();
+  if (GUSER && e === GUSER.toLowerCase()) return true; // always exclude login email
+  return EXCLUDE_EMAILS.includes(e);
+}
+
+// Try to get the main "lead" panel text (to avoid header/user chrome)
+async function getLeadPanelText(page) {
+  return await page.evaluate(() => {
+    const candidates = [];
+    // role=main first
+    const main = document.querySelector('[role="main"]');
+    if (main) candidates.push(main);
+
+    // Any element that contains Lead header labels
+    const allDivs = Array.from(document.querySelectorAll('div, section, main'));
+    for (const el of allDivs) {
+      const t = (el.innerText || '').toLowerCase();
+      if (t.includes('lead summary') || t.includes('conversation')) {
+        candidates.push(el);
+      }
+    }
+
+    // Return the largest informative candidate text
+    let best = '';
+    for (const el of candidates) {
+      const text = (el.innerText || '').trim();
+      if (text && text.length > best.length) best = text;
+    }
+    return best;
+  });
 }
 
 // Fallback scripted login (avoid when possible—prefer storage state)
@@ -70,19 +107,17 @@ async function loginGoogle(page) {
   ]);
 }
 
-// Poll the rendered DOM first; if no match, scan HTML source (good for SPA/WIZ JSON)
+// PHONE: DOM poll then HTML fallback
 async function findFirstPhoneOnPage(page, timeoutMs = 15000) {
   const deadline = Date.now() + timeoutMs;
 
-  // 1) Poll rendered text
   while (Date.now() < deadline) {
     const text = await page.evaluate(() => document.body?.innerText || '');
     const matches = text.match(UK_PHONE_REGEX_GLOBAL) || [];
-    if (matches.length) return matches[0]; // first in natural order
+    if (matches.length) return matches[0];
     await page.waitForTimeout(500);
   }
 
-  // 2) Fallback: HTML source
   const html = await page.content();
   const srcMatches = html.match(UK_PHONE_REGEX_GLOBAL) || [];
   if (srcMatches.length) return srcMatches[0];
@@ -90,20 +125,29 @@ async function findFirstPhoneOnPage(page, timeoutMs = 15000) {
   return null;
 }
 
+// EMAIL: lead panel first, then body, then HTML; exclude login/service emails
 async function findFirstEmailOnPage(page, timeoutMs = 15000) {
   const deadline = Date.now() + timeoutMs;
 
-  // 1) Poll rendered text (visual ordering)
+  // 1) Lead panel text first (reduces chance of grabbing login email)
+  const leadText = (await getLeadPanelText(page)) || '';
+  const panelMatches = (leadText.match(EMAIL_REGEX_GLOBAL) || [])
+    .filter(e => !isServiceEmail(e) && !isExcludedEmail(e));
+  if (panelMatches.length) return panelMatches[0];
+
+  // 2) Poll rendered body
   while (Date.now() < deadline) {
     const text = await page.evaluate(() => document.body?.innerText || '');
-    const matches = (text.match(EMAIL_REGEX_GLOBAL) || []).filter(e => !isServiceEmail(e));
+    const matches = (text.match(EMAIL_REGEX_GLOBAL) || [])
+      .filter(e => !isServiceEmail(e) && !isExcludedEmail(e));
     if (matches.length) return matches[0];
     await page.waitForTimeout(500);
   }
 
-  // 2) Fallback: HTML source (captures emails in inline JSON/script)
+  // 3) Fallback: HTML source
   const html = await page.content();
-  const srcMatches = (html.match(EMAIL_REGEX_GLOBAL) || []).filter(e => !isServiceEmail(e));
+  const srcMatches = (html.match(EMAIL_REGEX_GLOBAL) || [])
+    .filter(e => !isServiceEmail(e) && !isExcludedEmail(e));
   if (srcMatches.length) return srcMatches[0];
 
   return null;
@@ -159,78 +203,8 @@ app.post('/run-task', async (req, res) => {
     }
   }
 
-  // ----- Advanced: EXTRACT-PHONE -----
-  if (task === 'extract-phone') {
-    if (!url) return res.status(400).json({ error: 'url is required' });
-
-    const browser = await chromium.launch({ headless: true });
-    let context;
-    try {
-      const hasState = fs.existsSync(STATE_PATH);
-      context = hasState
-        ? await browser.newContext({ storageState: STATE_PATH })
-        : await browser.newContext();
-
-      const page = await context.newPage();
-
-      // If no Google cookies and no state, attempt fallback login once
-      const cookies = await context.cookies();
-      const hasGoogleCookie = cookies.some(c => c.domain.includes('google'));
-      log('hasState', hasState, 'hasGoogleCookie', hasGoogleCookie);
-
-      if (!hasGoogleCookie && GUSER && GPASS && !hasState) {
-        log('Attempting fallback login...');
-        await loginGoogle(page);
-        await context.storageState({ path: STATE_PATH });
-        log('Login complete; state saved');
-      }
-
-      log('goto', url);
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-      await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {});
-      await page.waitForTimeout(1000); // give SPA a moment to hydrate
-
-      // First check for "No phone number"
-      const bodyText = await page.evaluate(() => document.body?.innerText || '');
-      let phone = "Required";
-
-      if (!/no phone number/i.test(bodyText)) {
-        phone = (await findFirstPhoneOnPage(page, 15000)) || "Required";
-      }
-
-      log('extracted phone:', phone);
-
-      const result = { ok: phone !== "Required", phone, sourceUrl: url };
-
-      // Optional callback to Make.com webhook
-      const endpoint = callbackUrl || CALLBACK_URL;
-      if (endpoint) {
-        try {
-          await fetch(endpoint, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(result)
-          });
-          log('callback posted to', endpoint);
-        } catch (e) {
-          log('WARN(callback failed):', e.message);
-        }
-      }
-
-      return res.json(result);
-    } catch (err) {
-      log('ERROR(extract-phone):', err.message);
-      return res.status(500).json({ error: err.message, where: 'extract-phone' });
-    } finally {
-      try { if (context) await context.close(); } catch {}
-      await browser.close();
-    }
-  }
-
-  // ----- Advanced: EXTRACT-CONTACT (phone + email) -----
-  if (task === 'extract-contact') {
-    if (!url) return res.status(400).json({ error: 'url is required' });
-
+  // ----- Shared setup for extract-* tasks -----
+  async function withContext(run) {
     const browser = await chromium.launch({ headless: true });
     let context;
     try {
@@ -257,47 +231,115 @@ app.post('/run-task', async (req, res) => {
       await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {});
       await page.waitForTimeout(1000);
 
-      // Phone (with "No phone number" rule)
-      const bodyText = await page.evaluate(() => document.body?.innerText || '');
-      let phone = "Required";
-      if (!/no phone number/i.test(bodyText)) {
-        phone = (await findFirstPhoneOnPage(page, 15000)) || "Required";
-      }
+      return await run(page);
+    } finally {
+      try { if (context) await context.close(); } catch {}
+      await browser.close();
+    }
+  }
 
-      // Email (first wins, filter out service emails)
-      const email = (await findFirstEmailOnPage(page, 15000)) || "Required";
+  // ----- Advanced: EXTRACT-PHONE -----
+  if (task === 'extract-phone') {
+    if (!url) return res.status(400).json({ error: 'url is required' });
 
-      log('extracted phone:', phone, '| email:', email);
-
-      const result = {
-        ok: phone !== "Required" || email !== "Required",
-        phone,
-        email,
-        sourceUrl: url
-      };
-
-      // Optional callback to Make.com webhook
-      const endpoint = callbackUrl || CALLBACK_URL;
-      if (endpoint) {
-        try {
-          await fetch(endpoint, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(result)
-          });
-          log('callback posted to', endpoint);
-        } catch (e) {
-          log('WARN(callback failed):', e.message);
+    try {
+      const result = await withContext(async (page) => {
+        const bodyText = await page.evaluate(() => document.body?.innerText || '');
+        let phone = "Required";
+        if (!/no phone number/i.test(bodyText)) {
+          phone = (await findFirstPhoneOnPage(page, 15000)) || "Required";
         }
-      }
+        const payload = { ok: phone !== "Required", phone, sourceUrl: url };
 
+        const endpoint = callbackUrl || CALLBACK_URL;
+        if (endpoint) {
+          try {
+            await fetch(endpoint, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload)
+            });
+            log('callback posted to', endpoint);
+          } catch (e) { log('WARN(callback failed):', e.message); }
+        }
+        return payload;
+      });
+      return res.json(result);
+    } catch (err) {
+      log('ERROR(extract-phone):', err.message);
+      return res.status(500).json({ error: err.message, where: 'extract-phone' });
+    }
+  }
+
+  // ----- Advanced: EXTRACT-EMAIL -----
+  if (task === 'extract-email') {
+    if (!url) return res.status(400).json({ error: 'url is required' });
+
+    try {
+      const result = await withContext(async (page) => {
+        const email = (await findFirstEmailOnPage(page, 15000)) || "Required";
+        const payload = { ok: email !== "Required", email, sourceUrl: url };
+
+        const endpoint = callbackUrl || CALLBACK_URL;
+        if (endpoint) {
+          try {
+            await fetch(endpoint, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload)
+            });
+            log('callback posted to', endpoint);
+          } catch (e) { log('WARN(callback failed):', e.message); }
+        }
+        return payload;
+      });
+      return res.json(result);
+    } catch (err) {
+      log('ERROR(extract-email):', err.message);
+      return res.status(500).json({ error: err.message, where: 'extract-email' });
+    }
+  }
+
+  // ----- Advanced: EXTRACT-CONTACT (phone + email) -----
+  if (task === 'extract-contact') {
+    if (!url) return res.status(400).json({ error: 'url is required' });
+
+    try {
+      const result = await withContext(async (page) => {
+        // Phone (respect "No phone number")
+        const bodyText = await page.evaluate(() => document.body?.innerText || '');
+        let phone = "Required";
+        if (!/no phone number/i.test(bodyText)) {
+          phone = (await findFirstPhoneOnPage(page, 15000)) || "Required";
+        }
+
+        // Email (lead panel → body → html; exclude login/service)
+        const email = (await findFirstEmailOnPage(page, 15000)) || "Required";
+
+        const payload = {
+          ok: phone !== "Required" || email !== "Required",
+          phone,
+          email,
+          sourceUrl: url
+        };
+
+        const endpoint = callbackUrl || CALLBACK_URL;
+        if (endpoint) {
+          try {
+            await fetch(endpoint, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload)
+            });
+            log('callback posted to', endpoint);
+          } catch (e) { log('WARN(callback failed):', e.message); }
+        }
+        return payload;
+      });
       return res.json(result);
     } catch (err) {
       log('ERROR(extract-contact):', err.message);
       return res.status(500).json({ error: err.message, where: 'extract-contact' });
-    } finally {
-      try { if (context) await context.close(); } catch {}
-      await browser.close();
     }
   }
 
