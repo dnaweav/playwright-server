@@ -152,6 +152,143 @@ async function findFirstEmailOnPage(page, timeoutMs = 15000) {
 
   return null;
 }
+// ===== Numbergroup config =====
+const NG_USER  = process.env.NG_USER || "M007951";
+const NG_PASS  = process.env.NG_PASS || "Snakeysteve2023!";
+const NG_BASE  = process.env.NG_BASE || "https://portal.numbergroup.com";
+const NG_STATE = process.env.NG_STATE || "/tmp/ng-state.json";
+
+// Simple normalizer used to compare the table "Caller" cell vs the requested phone
+function normalizePhoneForMatch(p) {
+  return (p || "").replace(/[^\d]/g, "");
+}
+
+// If you don't pass dates, default to today's 00:00:00 → 23:59:59
+function defaultDateRange() {
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = String(now.getMonth() + 1).padStart(2, '0');
+  const d = String(now.getDate()).padStart(2, '0');
+  const from = `${y}-${m}-${d} 00:00:00`;
+  const to   = `${y}-${m}-${d} 23:59:59`;
+  return { from, to };
+}
+
+async function ngLogin(context) {
+  const page = await context.newPage();
+  await page.goto(`${NG_BASE}/`, { waitUntil: "domcontentloaded", timeout: 30000 });
+
+  // If already logged-in (session cookie/state), bail quickly
+  if ((await page.content()).toLowerCase().includes("media manager")) {
+    await page.close();
+    return;
+  }
+
+  // Adjust selectors to the actual login form (these are typical defaults)
+  await page.fill('input[type="email"], input[name="username"], input[name="email"]', NG_USER);
+  await page.fill('input[type="password"]', NG_PASS);
+  await Promise.all([
+    page.waitForLoadState('networkidle').catch(() => {}),
+    page.click('button[type="submit"], input[type="submit"], button:has-text("Sign in"), button:has-text("Log in")')
+  ]);
+
+  await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+  await page.close();
+}
+
+async function ngOpenMediaManager(page) {
+  // If your Media Manager is a different route, update here
+  const mediaUrl = `${NG_BASE}/media-manager`;
+  await page.goto(mediaUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+  await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+}
+
+async function ngSearch(page, phone, dateFrom, dateTo) {
+  // Fill date range if inputs exist
+  if (dateFrom) {
+    await page.fill('input[name="from"], input[placeholder*="From"]', dateFrom).catch(() => {});
+  }
+  if (dateTo) {
+    await page.fill('input[name="to"], input[placeholder*="To"]', dateTo).catch(() => {});
+  }
+
+  // Fill the number box; label is "Number"
+  await page.fill('input[name="number"], input[aria-label="Number"], input[placeholder*="Number"]', phone).catch(() => {});
+
+  // Click the SEARCH button
+  const searchButton = page.getByRole('button', { name: /search/i });
+  if (await searchButton.count()) {
+    await Promise.all([
+      page.waitForLoadState('networkidle').catch(() => {}),
+      searchButton.click()
+    ]);
+  } else {
+    await Promise.all([
+      page.waitForLoadState('networkidle').catch(() => {}),
+      page.click('button:has-text("SEARCH"), input[type="submit"][value*="SEARCH" i]').catch(() => {})
+    ]);
+  }
+
+  // Let results render
+  await page.waitForTimeout(1000);
+}
+
+// Returns { rowHandle, downloadLinkHandle } or null
+async function ngFindFirstRowWithCaller(page, phone) {
+  const want = normalizePhoneForMatch(phone);
+
+  // Adjust the selector if the table has a specific id/class
+  const rows = await page.$$('table tbody tr');
+  for (const row of rows) {
+    // Caller column is typically 2nd column; change index if needed.
+    const callerCell = await row.$('td:nth-child(2)');
+    const callerText = (callerCell ? (await callerCell.innerText()).trim() : (await row.innerText()).trim());
+    const callerDigits = callerText.replace(/[^\d]/g, "");
+
+    if (callerDigits.includes(want)) {
+      const link = await row.$('a:has-text("DOWNLOAD")');
+      if (link) return { rowHandle: row, downloadLinkHandle: link };
+    }
+  }
+  return null;
+}
+
+async function ngDownloadFirstMatch(context, page, phone, dateFrom, dateTo) {
+  await ngOpenMediaManager(page);
+  await ngSearch(page, phone, dateFrom, dateTo);
+
+  const hit = await ngFindFirstRowWithCaller(page, phone);
+  if (!hit) {
+    throw new Error('No matching row with that caller number');
+  }
+
+  // Trigger the download and wait for Playwright's download event
+  const [ download ] = await Promise.all([
+    page.waitForEvent('download', { timeout: 30000 }),
+    hit.downloadLinkHandle.click()
+  ]);
+
+  const suggested = download.suggestedFilename();
+  const maybePath = await download.path(); // can be null; if so, save manually
+  const mimeType = download.mimeType?.() || 'application/octet-stream';
+
+  let filePath = maybePath;
+  if (!filePath) {
+    const tmpPath = `/tmp/${Date.now()}_${suggested || 'recording'}`;
+    await download.saveAs(tmpPath);
+    filePath = tmpPath;
+  }
+
+  const buf = fs.readFileSync(filePath);
+  const base64 = buf.toString('base64');
+
+  return {
+    filename: suggested || `recording_${Date.now()}`,
+    mimeType,
+    size: buf.length,
+    base64
+  };
+}
 
 // ---------- Health ----------
 app.get('/', (_, res) => res.send('OK'));
@@ -345,6 +482,68 @@ app.post('/run-task', async (req, res) => {
 
   return res.status(400).json({ error: `Unsupported task: ${task}` });
 });
+
+// ----- Numbergroup: NG-DOWNLOAD -----
+if (task === 'ng-download') {
+  const { phone, dateFrom, dateTo } = req.body || {};
+  if (!phone) return res.status(400).json({ error: 'phone is required' });
+  if (!NG_USER || !NG_PASS) return res.status(400).json({ error: 'NG_USER/NG_PASS not set' });
+
+  // Defaults for dates if not provided
+  const dr = defaultDateRange();
+  const df = dateFrom || dr.from;
+  const dt = dateTo   || dr.to;
+
+  const browser = await chromium.launch({ headless: true });
+  let context;
+  try {
+    const hasState = NG_STATE && fs.existsSync(NG_STATE);
+    context = hasState
+      ? await browser.newContext({ storageState: NG_STATE, acceptDownloads: true })
+      : await browser.newContext({ acceptDownloads: true });
+
+    // Login (uses state if available)
+    await ngLogin(context);
+    if (NG_STATE && !hasState) {
+      // Save state after first successful login
+      await context.storageState({ path: NG_STATE });
+    }
+
+    const page = await context.newPage();
+    const file = await ngDownloadFirstMatch(context, page, phone, df, dt);
+
+    const result = {
+      ok: true,
+      requestedPhone: phone,           // <-- echo the original phone
+      ...file,                         // filename, mimeType, size, base64
+      sourceUrl: `${NG_BASE}/media-manager`,
+      dateFrom: df,
+      dateTo: dt
+    };
+
+    const endpoint = req.body.callbackUrl || CALLBACK_URL;
+    if (endpoint) {
+      try {
+        await fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(result)
+        });
+      } catch (e) {
+        console.log('[ng-download] callback failed:', e.message);
+      }
+    }
+
+    return res.json(result);
+  } catch (err) {
+    console.error('[ng-download] ERROR:', err);
+    return res.status(500).json({ error: err.message, where: 'ng-download' });
+  } finally {
+    try { if (context) await context.close(); } catch {}
+    await browser.close();
+  }
+}
+
 
 // ----------  Start ----------
 const PORT = process.env.PORT || 3000;
