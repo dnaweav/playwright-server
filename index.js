@@ -16,6 +16,7 @@ const GUSER         = process.env.GOOGLE_USER || "";     // optional fallback
 const GPASS         = process.env.GOOGLE_PASS || "";     // optional fallback
 const CALLBACK_URL  = process.env.CALLBACK_URL || "";    // optional Make webhook
 const STATE_PATH    = '/tmp/google-state.json';
+
 // NEW: optional comma-separated list of emails to ignore (in addition to GOOGLE_USER)
 const EXCLUDE_EMAILS = (process.env.EXCLUDE_EMAILS || '')
   .split(',')
@@ -32,7 +33,7 @@ try {
   console.log('WARN: could not seed GOOGLE_STATE_B64:', e.message);
 }
 
-// ---------- Helpers ----------
+// ---------- Helpers (Lead scraping) ----------
 
 // Accept +44, 07…, 01…, 02… with optional spaces/hyphens; global for all matches in page-order
 const UK_PHONE_REGEX_GLOBAL =
@@ -63,11 +64,8 @@ function isExcludedEmail(email) {
 async function getLeadPanelText(page) {
   return await page.evaluate(() => {
     const candidates = [];
-    // role=main first
     const main = document.querySelector('[role="main"]');
     if (main) candidates.push(main);
-
-    // Any element that contains Lead header labels
     const allDivs = Array.from(document.querySelectorAll('div, section, main'));
     for (const el of allDivs) {
       const t = (el.innerText || '').toLowerCase();
@@ -75,8 +73,6 @@ async function getLeadPanelText(page) {
         candidates.push(el);
       }
     }
-
-    // Return the largest informative candidate text
     let best = '';
     for (const el of candidates) {
       const text = (el.innerText || '').trim();
@@ -110,18 +106,15 @@ async function loginGoogle(page) {
 // PHONE: DOM poll then HTML fallback
 async function findFirstPhoneOnPage(page, timeoutMs = 15000) {
   const deadline = Date.now() + timeoutMs;
-
   while (Date.now() < deadline) {
     const text = await page.evaluate(() => document.body?.innerText || '');
     const matches = text.match(UK_PHONE_REGEX_GLOBAL) || [];
     if (matches.length) return matches[0];
     await page.waitForTimeout(500);
   }
-
   const html = await page.content();
   const srcMatches = html.match(UK_PHONE_REGEX_GLOBAL) || [];
   if (srcMatches.length) return srcMatches[0];
-
   return null;
 }
 
@@ -129,13 +122,11 @@ async function findFirstPhoneOnPage(page, timeoutMs = 15000) {
 async function findFirstEmailOnPage(page, timeoutMs = 15000) {
   const deadline = Date.now() + timeoutMs;
 
-  // 1) Lead panel text first (reduces chance of grabbing login email)
   const leadText = (await getLeadPanelText(page)) || '';
   const panelMatches = (leadText.match(EMAIL_REGEX_GLOBAL) || [])
     .filter(e => !isServiceEmail(e) && !isExcludedEmail(e));
   if (panelMatches.length) return panelMatches[0];
 
-  // 2) Poll rendered body
   while (Date.now() < deadline) {
     const text = await page.evaluate(() => document.body?.innerText || '');
     const matches = (text.match(EMAIL_REGEX_GLOBAL) || [])
@@ -144,7 +135,6 @@ async function findFirstEmailOnPage(page, timeoutMs = 15000) {
     await page.waitForTimeout(500);
   }
 
-  // 3) Fallback: HTML source
   const html = await page.content();
   const srcMatches = (html.match(EMAIL_REGEX_GLOBAL) || [])
     .filter(e => !isServiceEmail(e) && !isExcludedEmail(e));
@@ -152,18 +142,18 @@ async function findFirstEmailOnPage(page, timeoutMs = 15000) {
 
   return null;
 }
-// ===== Numbergroup config =====
-const NG_USER  = process.env.NG_USER || "";
-const NG_PASS  = process.env.NG_PASS || "";
-const NG_BASE  = process.env.NG_BASE || "https://portal.numbergroup.com";
-const NG_STATE = process.env.NG_STATE || "/tmp/ng-state.json";
 
-// Simple normalizer used to compare the table "Caller" cell vs the requested phone
+// ---------- Numbergroup config & helpers ----------
+const NG_USER      = process.env.NG_USER || "";
+const NG_PASS      = process.env.NG_PASS || "";
+const NG_BASE      = process.env.NG_BASE || "https://portal.numbergroup.com";
+const NG_STATE     = process.env.NG_STATE || "/tmp/ng-state.json";
+const NG_LOGIN_URL = process.env.NG_LOGIN_URL || ""; // optional forced login URL
+
 function normalizePhoneForMatch(p) {
   return (p || "").replace(/[^\d]/g, "");
 }
 
-// If you don't pass dates, default to today's 00:00:00 → 23:59:59
 function defaultDateRange() {
   const now = new Date();
   const y = now.getFullYear();
@@ -174,37 +164,71 @@ function defaultDateRange() {
   return { from, to };
 }
 
+function ngCandidateLoginUrls() {
+  const list = [];
+  if (NG_LOGIN_URL) list.push(NG_LOGIN_URL);
+  list.push(`${NG_BASE}/`, `${NG_BASE}/login`, `${NG_BASE}/auth/login`);
+  return [...new Set(list)];
+}
+
+async function ngIsLoggedIn(page) {
+  const html = (await page.content()).toLowerCase();
+  return html.includes("media manager") ||
+         html.includes("download") ||
+         html.includes("logout") ||
+         html.includes("dashboard");
+}
+
+// Matches your screenshot: input.formTextEditor + input[type=password] + input.roundedbutton[value="log in"]
 async function ngLogin(context) {
   const page = await context.newPage();
-  await page.goto(`${NG_BASE}/`, { waitUntil: "domcontentloaded", timeout: 30000 });
 
-  // If already logged-in (session cookie/state), bail quickly
-  if ((await page.content()).toLowerCase().includes("media manager")) {
-    await page.close();
-    return;
+  for (const url of ngCandidateLoginUrls()) {
+    try {
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+      await page.waitForLoadState("networkidle", { timeout: 8000 }).catch(() => {});
+      if (await ngIsLoggedIn(page)) { await page.close(); return; }
+
+      const userSel =
+        'input.formTextEditor, input#username, input[name="username"], input[type="text"]';
+      const passSel =
+        'input[type="password"], input#password, input[name="password"]';
+      const submitSel =
+        'input.roundedbutton[value*="log in" i], input[type="submit"][value*="log in" i], button:has-text("log in")';
+
+      const user = page.locator(userSel).first();
+      if (!(await user.count())) continue; // try next candidate URL
+
+      await user.fill(NG_USER, { timeout: 15000 });
+      await page.locator(passSel).first().fill(NG_PASS, { timeout: 15000 });
+
+      await Promise.all([
+        page.waitForLoadState("networkidle").catch(() => {}),
+        page.locator(submitSel).first().click({ timeout: 10000 }).catch(() => {})
+      ]);
+
+      await page.waitForLoadState("networkidle", { timeout: 12000 }).catch(() => {});
+      if (await ngIsLoggedIn(page)) { await page.close(); return; }
+
+      // Capture artifacts if it looked like it submitted but didn't log in
+      try {
+        await page.screenshot({ path: "/tmp/ng-login-after-submit.png", fullPage: true });
+        fs.writeFileSync("/tmp/ng-login.html", await page.content());
+      } catch {}
+    } catch {}
   }
 
-  // Adjust selectors to the actual login form (these are typical defaults)
-  await page.fill('input[type="email"], input[name="username"], input[name="email"]', NG_USER);
-  await page.fill('input[type="password"]', NG_PASS);
-  await Promise.all([
-    page.waitForLoadState('networkidle').catch(() => {}),
-    page.click('button[type="submit"], input[type="submit"], button:has-text("Sign in"), button:has-text("Log in")')
-  ]);
-
-  await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
   await page.close();
+  throw new Error("Login failed: could not find login fields or authenticate.");
 }
 
 async function ngOpenMediaManager(page) {
-  // If your Media Manager is a different route, update here
   const mediaUrl = `${NG_BASE}/media-manager`;
   await page.goto(mediaUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
   await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
 }
 
 async function ngSearch(page, phone, dateFrom, dateTo) {
-  // Fill date range if inputs exist
   if (dateFrom) {
     await page.fill('input[name="from"], input[placeholder*="From"]', dateFrom).catch(() => {});
   }
@@ -212,10 +236,8 @@ async function ngSearch(page, phone, dateFrom, dateTo) {
     await page.fill('input[name="to"], input[placeholder*="To"]', dateTo).catch(() => {});
   }
 
-  // Fill the number box; label is "Number"
   await page.fill('input[name="number"], input[aria-label="Number"], input[placeholder*="Number"]', phone).catch(() => {});
 
-  // Click the SEARCH button
   const searchButton = page.getByRole('button', { name: /search/i });
   if (await searchButton.count()) {
     await Promise.all([
@@ -228,23 +250,16 @@ async function ngSearch(page, phone, dateFrom, dateTo) {
       page.click('button:has-text("SEARCH"), input[type="submit"][value*="SEARCH" i]').catch(() => {})
     ]);
   }
-
-  // Let results render
   await page.waitForTimeout(1000);
 }
 
-// Returns { rowHandle, downloadLinkHandle } or null
 async function ngFindFirstRowWithCaller(page, phone) {
   const want = normalizePhoneForMatch(phone);
-
-  // Adjust the selector if the table has a specific id/class
   const rows = await page.$$('table tbody tr');
   for (const row of rows) {
-    // Caller column is typically 2nd column; change index if needed.
     const callerCell = await row.$('td:nth-child(2)');
     const callerText = (callerCell ? (await callerCell.innerText()).trim() : (await row.innerText()).trim());
     const callerDigits = callerText.replace(/[^\d]/g, "");
-
     if (callerDigits.includes(want)) {
       const link = await row.$('a:has-text("DOWNLOAD")');
       if (link) return { rowHandle: row, downloadLinkHandle: link };
@@ -258,18 +273,15 @@ async function ngDownloadFirstMatch(context, page, phone, dateFrom, dateTo) {
   await ngSearch(page, phone, dateFrom, dateTo);
 
   const hit = await ngFindFirstRowWithCaller(page, phone);
-  if (!hit) {
-    throw new Error('No matching row with that caller number');
-  }
+  if (!hit) throw new Error('No matching row with that caller number');
 
-  // Trigger the download and wait for Playwright's download event
   const [ download ] = await Promise.all([
     page.waitForEvent('download', { timeout: 30000 }),
     hit.downloadLinkHandle.click()
   ]);
 
   const suggested = download.suggestedFilename();
-  const maybePath = await download.path(); // can be null; if so, save manually
+  const maybePath = await download.path();
   const mimeType = download.mimeType?.() || 'application/octet-stream';
 
   let filePath = maybePath;
@@ -483,7 +495,6 @@ app.post('/run-task', async (req, res) => {
     if (!phone) return res.status(400).json({ error: 'phone is required' });
     if (!NG_USER || !NG_PASS) return res.status(400).json({ error: 'NG_USER/NG_PASS not set' });
 
-    // Defaults for dates if not provided
     const dr = defaultDateRange();
     const df = dateFrom || dr.from;
     const dt = dateTo   || dr.to;
@@ -493,10 +504,18 @@ app.post('/run-task', async (req, res) => {
     try {
       const hasState = NG_STATE && fs.existsSync(NG_STATE);
       context = hasState
-        ? await browser.newContext({ storageState: NG_STATE, acceptDownloads: true })
-        : await browser.newContext({ acceptDownloads: true });
+        ? await browser.newContext({
+            storageState: NG_STATE,
+            acceptDownloads: true,
+            userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
+            locale: "en-GB"
+          })
+        : await browser.newContext({
+            acceptDownloads: true,
+            userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
+            locale: "en-GB"
+          });
 
-      // Login (uses state if available)
       await ngLogin(context);
       if (NG_STATE && !hasState) {
         await context.storageState({ path: NG_STATE });
@@ -508,7 +527,7 @@ app.post('/run-task', async (req, res) => {
       const result = {
         ok: true,
         requestedPhone: phone,
-        ...file, // filename, mimeType, size, base64
+        ...file,
         sourceUrl: `${NG_BASE}/media-manager`,
         dateFrom: df,
         dateTo: dt
@@ -544,4 +563,3 @@ app.post('/run-task', async (req, res) => {
 // ---------- Start ----------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
-
