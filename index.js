@@ -179,48 +179,45 @@ async function ngIsLoggedIn(page) {
          html.includes("dashboard");
 }
 
-// Matches your screenshot: input.formTextEditor + input[type=password] + input.roundedbutton[value="log in"]
 async function ngLogin(context) {
   const page = await context.newPage();
+  await page.goto(`${NG_BASE}/`, { waitUntil: "domcontentloaded", timeout: 30000 });
 
-  for (const url of ngCandidateLoginUrls()) {
-    try {
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
-      await page.waitForLoadState("networkidle", { timeout: 8000 }).catch(() => {});
-      if (await ngIsLoggedIn(page)) { await page.close(); return; }
-
-      const userSel =
-        'input.formTextEditor, input#username, input[name="username"], input[type="text"]';
-      const passSel =
-        'input[type="password"], input#password, input[name="password"]';
-      const submitSel =
-        'input.roundedbutton[value*="log in" i], input[type="submit"][value*="log in" i], button:has-text("log in")';
-
-      const user = page.locator(userSel).first();
-      if (!(await user.count())) continue; // try next candidate URL
-
-      await user.fill(NG_USER, { timeout: 15000 });
-      await page.locator(passSel).first().fill(NG_PASS, { timeout: 15000 });
-
-      await Promise.all([
-        page.waitForLoadState("networkidle").catch(() => {}),
-        page.locator(submitSel).first().click({ timeout: 10000 }).catch(() => {})
-      ]);
-
-      await page.waitForLoadState("networkidle", { timeout: 12000 }).catch(() => {});
-      if (await ngIsLoggedIn(page)) { await page.close(); return; }
-
-      // Capture artifacts if it looked like it submitted but didn't log in
-      try {
-        await page.screenshot({ path: "/tmp/ng-login-after-submit.png", fullPage: true });
-        fs.writeFileSync("/tmp/ng-login.html", await page.content());
-      } catch {}
-    } catch {}
+  // If we’re already past login, bail
+  const html0 = (await page.content()).toLowerCase();
+  if (html0.includes('media manager') || html0.includes('logout')) {
+    await page.close();
+    return;
   }
 
+  // Fill login form (Numbergroup uses simple inputs with type="text"/"password")
+  const userSel = 'input[type="text"], input[name="username"], input[name="email"]';
+  const passSel = 'input[type="password"]';
+
+  await page.waitForSelector(userSel, { timeout: 30000 });
+  await page.fill(userSel, NG_USER);
+
+  await page.waitForSelector(passSel, { timeout: 30000 });
+  await page.fill(passSel, NG_PASS);
+
+  await Promise.all([
+    page.waitForLoadState('networkidle').catch(() => {}),
+    page.click('button:has-text("LOG IN"), button:has-text("SIGN IN"), input[type="submit"], button[type="submit"]').catch(() => {})
+  ]);
+
+  // If they prompt for 2FA setup, click "Skip for now"
+  const skipBtn = page.getByRole('button', { name: /skip for now/i });
+  if (await skipBtn.count().catch(() => 0)) {
+    await Promise.all([
+      page.waitForLoadState('networkidle').catch(() => {}),
+      skipBtn.click()
+    ]);
+  }
+
+  await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
   await page.close();
-  throw new Error("Login failed: could not find login fields or authenticate.");
 }
+
 
 async function ngOpenMediaManager(page) {
   const mediaUrl = `${NG_BASE}/media-manager`;
@@ -229,6 +226,7 @@ async function ngOpenMediaManager(page) {
 }
 
 async function ngSearch(page, phone, dateFrom, dateTo) {
+  // Fill date range if inputs exist
   if (dateFrom) {
     await page.fill('input[name="from"], input[placeholder*="From"]', dateFrom).catch(() => {});
   }
@@ -236,13 +234,18 @@ async function ngSearch(page, phone, dateFrom, dateTo) {
     await page.fill('input[name="to"], input[placeholder*="To"]', dateTo).catch(() => {});
   }
 
-  await page.fill('input[name="number"], input[aria-label="Number"], input[placeholder*="Number"]', phone).catch(() => {});
+  // Fill the Number box (label is “Number”)
+  await page.fill(
+    'input[name="number"], input[aria-label="Number"], input[placeholder*="Number"]',
+    phone
+  ).catch(() => {});
 
-  const searchButton = page.getByRole('button', { name: /search/i });
-  if (await searchButton.count()) {
+  // Click SEARCH
+  const searchBtn = page.getByRole('button', { name: /search/i });
+  if (await searchBtn.count()) {
     await Promise.all([
       page.waitForLoadState('networkidle').catch(() => {}),
-      searchButton.click()
+      searchBtn.click()
     ]);
   } else {
     await Promise.all([
@@ -250,23 +253,57 @@ async function ngSearch(page, phone, dateFrom, dateTo) {
       page.click('button:has-text("SEARCH"), input[type="submit"][value*="SEARCH" i]').catch(() => {})
     ]);
   }
-  await page.waitForTimeout(1000);
+
+  // Wait for the results table to render rows
+  const resultsTable = page.locator('table').filter({
+    has: page.locator('th', { hasText: /caller/i })
+  }).first();
+
+  await resultsTable.waitFor({ timeout: 15000 }).catch(() => {});
+  await resultsTable.locator('tbody tr').first().waitFor({ timeout: 15000 }).catch(() => {});
 }
 
+
+// Returns { rowHandle, downloadLinkHandle } or null
 async function ngFindFirstRowWithCaller(page, phone) {
   const want = normalizePhoneForMatch(phone);
-  const rows = await page.$$('table tbody tr');
-  for (const row of rows) {
-    const callerCell = await row.$('td:nth-child(2)');
-    const callerText = (callerCell ? (await callerCell.innerText()).trim() : (await row.innerText()).trim());
-    const callerDigits = callerText.replace(/[^\d]/g, "");
-    if (callerDigits.includes(want)) {
-      const link = await row.$('a:has-text("DOWNLOAD")');
-      if (link) return { rowHandle: row, downloadLinkHandle: link };
+
+  // Find the *results* table by its header (“Caller”)
+  const table = page.locator('table').filter({
+    has: page.locator('th', { hasText: /caller/i })
+  }).first();
+
+  // Ensure it exists and has some rows
+  await table.waitFor({ timeout: 15000 });
+
+  const rows = table.locator('tbody tr');
+  const count = await rows.count();
+
+  // Optional debug logs (uncomment if you need to see what we see)
+  // console.log('[ng-download] rows in results table:', count);
+
+  for (let i = 0; i < count; i++) {
+    const row = rows.nth(i);
+
+    // Caller column is the 2nd column in your screenshot
+    const callerCell = row.locator('td').nth(1); // 0-based index => 2nd column
+    const text = ((await callerCell.innerText().catch(() => '')) || '').trim();
+    const digits = text.replace(/[^\d]/g, '');
+
+    // console.log(`[ng-download] row ${i} caller raw="${text}" digits="${digits}"`);
+
+    if (digits && digits.includes(want)) {
+      // Find the DOWNLOAD link within this row
+      const downloadLink = row.locator('a', { hasText: /download/i }).first();
+      if (await downloadLink.count()) {
+        return { rowHandle: row, downloadLinkHandle: downloadLink };
+      }
     }
   }
+
   return null;
 }
+
 
 async function ngDownloadFirstMatch(context, page, phone, dateFrom, dateTo) {
   await ngOpenMediaManager(page);
