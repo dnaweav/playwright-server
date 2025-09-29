@@ -153,8 +153,8 @@ async function findFirstEmailOnPage(page, timeoutMs = 15000) {
   return null;
 }
 // ===== Numbergroup config =====
-const NG_USER  = process.env.NG_USER || "M007951";
-const NG_PASS  = process.env.NG_PASS || "Snakeysteve2023!";
+const NG_USER  = process.env.NG_USER || "";
+const NG_PASS  = process.env.NG_PASS || "";
 const NG_BASE  = process.env.NG_BASE || "https://portal.numbergroup.com";
 const NG_STATE = process.env.NG_STATE || "/tmp/ng-state.json";
 
@@ -443,14 +443,11 @@ app.post('/run-task', async (req, res) => {
 
     try {
       const result = await withContext(async (page) => {
-        // Phone (respect "No phone number")
         const bodyText = await page.evaluate(() => document.body?.innerText || '');
         let phone = "Required";
         if (!/no phone number/i.test(bodyText)) {
           phone = (await findFirstPhoneOnPage(page, 15000)) || "Required";
         }
-
-        // Email (lead panel → body → html; exclude login/service)
         const email = (await findFirstEmailOnPage(page, 15000)) || "Required";
 
         const payload = {
@@ -480,71 +477,71 @@ app.post('/run-task', async (req, res) => {
     }
   }
 
+  // ===== Numbergroup: NG-DOWNLOAD =====
+  if (task === 'ng-download') {
+    const { phone, dateFrom, dateTo } = req.body || {};
+    if (!phone) return res.status(400).json({ error: 'phone is required' });
+    if (!NG_USER || !NG_PASS) return res.status(400).json({ error: 'NG_USER/NG_PASS not set' });
+
+    // Defaults for dates if not provided
+    const dr = defaultDateRange();
+    const df = dateFrom || dr.from;
+    const dt = dateTo   || dr.to;
+
+    const browser = await chromium.launch({ headless: true });
+    let context;
+    try {
+      const hasState = NG_STATE && fs.existsSync(NG_STATE);
+      context = hasState
+        ? await browser.newContext({ storageState: NG_STATE, acceptDownloads: true })
+        : await browser.newContext({ acceptDownloads: true });
+
+      // Login (uses state if available)
+      await ngLogin(context);
+      if (NG_STATE && !hasState) {
+        await context.storageState({ path: NG_STATE });
+      }
+
+      const page = await context.newPage();
+      const file = await ngDownloadFirstMatch(context, page, phone, df, dt);
+
+      const result = {
+        ok: true,
+        requestedPhone: phone,
+        ...file, // filename, mimeType, size, base64
+        sourceUrl: `${NG_BASE}/media-manager`,
+        dateFrom: df,
+        dateTo: dt
+      };
+
+      const endpoint = req.body.callbackUrl || CALLBACK_URL;
+      if (endpoint) {
+        try {
+          await fetch(endpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(result)
+          });
+        } catch (e) {
+          console.log('[ng-download] callback failed:', e.message);
+        }
+      }
+
+      return res.json(result);
+    } catch (err) {
+      console.error('[ng-download] ERROR:', err);
+      return res.status(500).json({ error: err.message, where: 'ng-download' });
+    } finally {
+      try { if (context) await context.close(); } catch {}
+      await browser.close();
+    }
+  }
+
+  // ----- Fallback -----
   return res.status(400).json({ error: `Unsupported task: ${task}` });
 });
 
-// ----- Numbergroup: NG-DOWNLOAD -----
-if (task === 'ng-download') {
-  const { phone, dateFrom, dateTo } = req.body || {};
-  if (!phone) return res.status(400).json({ error: 'phone is required' });
-  if (!NG_USER || !NG_PASS) return res.status(400).json({ error: 'NG_USER/NG_PASS not set' });
-
-  // Defaults for dates if not provided
-  const dr = defaultDateRange();
-  const df = dateFrom || dr.from;
-  const dt = dateTo   || dr.to;
-
-  const browser = await chromium.launch({ headless: true });
-  let context;
-  try {
-    const hasState = NG_STATE && fs.existsSync(NG_STATE);
-    context = hasState
-      ? await browser.newContext({ storageState: NG_STATE, acceptDownloads: true })
-      : await browser.newContext({ acceptDownloads: true });
-
-    // Login (uses state if available)
-    await ngLogin(context);
-    if (NG_STATE && !hasState) {
-      // Save state after first successful login
-      await context.storageState({ path: NG_STATE });
-    }
-
-    const page = await context.newPage();
-    const file = await ngDownloadFirstMatch(context, page, phone, df, dt);
-
-    const result = {
-      ok: true,
-      requestedPhone: phone,           // <-- echo the original phone
-      ...file,                         // filename, mimeType, size, base64
-      sourceUrl: `${NG_BASE}/media-manager`,
-      dateFrom: df,
-      dateTo: dt
-    };
-
-    const endpoint = req.body.callbackUrl || CALLBACK_URL;
-    if (endpoint) {
-      try {
-        await fetch(endpoint, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(result)
-        });
-      } catch (e) {
-        console.log('[ng-download] callback failed:', e.message);
-      }
-    }
-
-    return res.json(result);
-  } catch (err) {
-    console.error('[ng-download] ERROR:', err);
-    return res.status(500).json({ error: err.message, where: 'ng-download' });
-  } finally {
-    try { if (context) await context.close(); } catch {}
-    await browser.close();
-  }
-}
-
-
-// ----------  Start ----------
+// ---------- Start ----------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
