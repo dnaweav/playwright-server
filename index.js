@@ -17,7 +17,7 @@ const GPASS         = process.env.GOOGLE_PASS || "";     // optional fallback
 const CALLBACK_URL  = process.env.CALLBACK_URL || "";    // optional Make webhook
 const STATE_PATH    = '/tmp/google-state.json';
 
-// NEW: optional comma-separated list of emails to ignore (in addition to GOOGLE_USER)
+// Optional comma-separated list of emails to ignore (added to login email)
 const EXCLUDE_EMAILS = (process.env.EXCLUDE_EMAILS || '')
   .split(',')
   .map(s => s.trim().toLowerCase())
@@ -35,7 +35,7 @@ try {
 
 // ---------- Helpers (Lead scraping) ----------
 
-// Accept +44, 07…, 01…, 02… with optional spaces/hyphens; global for all matches in page-order
+// Accept +44, 07…, 01…, 02… with optional spaces/hyphens; global for ordered matches
 const UK_PHONE_REGEX_GLOBAL =
   /\b(?:\+44\s?\d(?:[\s-]?\d){8,9}|07(?:[\s-]?\d){9}|0[12](?:[\s-]?\d){8,9})\b/g;
 
@@ -60,19 +60,53 @@ function isExcludedEmail(email) {
   return EXCLUDE_EMAILS.includes(e);
 }
 
-// Try to get the main "lead" panel text (to avoid header/user chrome)
+// ---------- Our numbers blocklist (never return these) ----------
+const BLOCKED_PHONES = [
+  "020 3519 9816",
+  "01872 465067",
+  "020 3519 9325",
+  "07491 786550",
+  "020 3519 2748",
+  "0247 7411008",
+  "0203 5193564",
+  "01442935082",
+  "0203 6700435",
+  "020 3519 9193",
+  "01784 656042",
+  "01726 420021",
+  "01904 378049",
+  "01392 243076",
+  "020 3677 0465",
+  // allow extending via env var (comma-separated)
+  ...(process.env.BLOCKED_PHONES || "")
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean)
+];
+
+// Normalize for comparison: digits only; map +44… to 0… for UK.
+function normalizePhoneForCompare(p = "") {
+  const digits = String(p).replace(/\D/g, "");
+  if (digits.startsWith("44") && digits.length >= 10) {
+    return "0" + digits.slice(2); // +44 20… -> 020…
+  }
+  return digits;
+}
+const BLOCKED_SET = new Set(BLOCKED_PHONES.map(normalizePhoneForCompare));
+
+// Try to get the main "lead" panel text (avoid header/user chrome)
 async function getLeadPanelText(page) {
   return await page.evaluate(() => {
     const candidates = [];
     const main = document.querySelector('[role="main"]');
     if (main) candidates.push(main);
-    const allDivs = Array.from(document.querySelectorAll('div, section, main'));
-    for (const el of allDivs) {
+
+    const all = Array.from(document.querySelectorAll('div, section, main'));
+    for (const el of all) {
       const t = (el.innerText || '').toLowerCase();
-      if (t.includes('lead summary') || t.includes('conversation')) {
-        candidates.push(el);
-      }
+      if (t.includes('lead summary') || t.includes('conversation')) candidates.push(el);
     }
+
     let best = '';
     for (const el of candidates) {
       const text = (el.innerText || '').trim();
@@ -103,18 +137,30 @@ async function loginGoogle(page) {
   ]);
 }
 
-// PHONE: DOM poll then HTML fallback
+// PHONE: DOM poll then HTML fallback (first allowed match in natural order)
 async function findFirstPhoneOnPage(page, timeoutMs = 15000) {
   const deadline = Date.now() + timeoutMs;
+
+  const pickFirstAllowed = (arr) => {
+    for (const raw of arr || []) {
+      if (!BLOCKED_SET.has(normalizePhoneForCompare(raw))) return raw;
+    }
+    return null;
+  };
+
+  // 1) Poll rendered text
   while (Date.now() < deadline) {
     const text = await page.evaluate(() => document.body?.innerText || '');
-    const matches = text.match(UK_PHONE_REGEX_GLOBAL) || [];
-    if (matches.length) return matches[0];
+    const match = pickFirstAllowed(text.match(UK_PHONE_REGEX_GLOBAL));
+    if (match) return match;
     await page.waitForTimeout(500);
   }
+
+  // 2) Fallback: HTML source
   const html = await page.content();
-  const srcMatches = html.match(UK_PHONE_REGEX_GLOBAL) || [];
-  if (srcMatches.length) return srcMatches[0];
+  const srcMatch = pickFirstAllowed(html.match(UK_PHONE_REGEX_GLOBAL));
+  if (srcMatch) return srcMatch;
+
   return null;
 }
 
@@ -122,11 +168,13 @@ async function findFirstPhoneOnPage(page, timeoutMs = 15000) {
 async function findFirstEmailOnPage(page, timeoutMs = 15000) {
   const deadline = Date.now() + timeoutMs;
 
+  // 1) Lead panel
   const leadText = (await getLeadPanelText(page)) || '';
   const panelMatches = (leadText.match(EMAIL_REGEX_GLOBAL) || [])
     .filter(e => !isServiceEmail(e) && !isExcludedEmail(e));
   if (panelMatches.length) return panelMatches[0];
 
+  // 2) Body poll
   while (Date.now() < deadline) {
     const text = await page.evaluate(() => document.body?.innerText || '');
     const matches = (text.match(EMAIL_REGEX_GLOBAL) || [])
@@ -135,208 +183,13 @@ async function findFirstEmailOnPage(page, timeoutMs = 15000) {
     await page.waitForTimeout(500);
   }
 
+  // 3) HTML fallback
   const html = await page.content();
   const srcMatches = (html.match(EMAIL_REGEX_GLOBAL) || [])
     .filter(e => !isServiceEmail(e) && !isExcludedEmail(e));
   if (srcMatches.length) return srcMatches[0];
 
   return null;
-}
-
-// ---------- Numbergroup config & helpers ----------
-const NG_USER      = process.env.NG_USER || "";
-const NG_PASS      = process.env.NG_PASS || "";
-const NG_BASE      = process.env.NG_BASE || "https://portal.numbergroup.com";
-const NG_STATE     = process.env.NG_STATE || "/tmp/ng-state.json";
-const NG_LOGIN_URL = process.env.NG_LOGIN_URL || ""; // optional forced login URL
-
-function normalizePhoneForMatch(p) {
-  return (p || "").replace(/[^\d]/g, "");
-}
-
-function defaultDateRange() {
-  const now = new Date();
-  const y = now.getFullYear();
-  const m = String(now.getMonth() + 1).padStart(2, '0');
-  const d = String(now.getDate()).padStart(2, '0');
-  const from = `${y}-${m}-${d} 00:00:00`;
-  const to   = `${y}-${m}-${d} 23:59:59`;
-  return { from, to };
-}
-
-function ngCandidateLoginUrls() {
-  const list = [];
-  if (NG_LOGIN_URL) list.push(NG_LOGIN_URL);
-  list.push(`${NG_BASE}/`, `${NG_BASE}/login`, `${NG_BASE}/auth/login`);
-  return [...new Set(list)];
-}
-
-async function ngIsLoggedIn(page) {
-  const html = (await page.content()).toLowerCase();
-  return html.includes("media manager") ||
-         html.includes("download") ||
-         html.includes("logout") ||
-         html.includes("dashboard");
-}
-
-async function ngLogin(context) {
-  const page = await context.newPage();
-  await page.goto(`${NG_BASE}/`, { waitUntil: "domcontentloaded", timeout: 30000 });
-
-  // If we’re already past login, bail
-  const html0 = (await page.content()).toLowerCase();
-  if (html0.includes('media manager') || html0.includes('logout')) {
-    await page.close();
-    return;
-  }
-
-  // Fill login form (Numbergroup uses simple inputs with type="text"/"password")
-  const userSel = 'input[type="text"], input[name="username"], input[name="email"]';
-  const passSel = 'input[type="password"]';
-
-  await page.waitForSelector(userSel, { timeout: 30000 });
-  await page.fill(userSel, NG_USER);
-
-  await page.waitForSelector(passSel, { timeout: 30000 });
-  await page.fill(passSel, NG_PASS);
-
-  await Promise.all([
-    page.waitForLoadState('networkidle').catch(() => {}),
-    page.click('button:has-text("LOG IN"), button:has-text("SIGN IN"), input[type="submit"], button[type="submit"]').catch(() => {})
-  ]);
-
-  // If they prompt for 2FA setup, click "Skip for now"
-  const skipBtn = page.getByRole('button', { name: /skip for now/i });
-  if (await skipBtn.count().catch(() => 0)) {
-    await Promise.all([
-      page.waitForLoadState('networkidle').catch(() => {}),
-      skipBtn.click()
-    ]);
-  }
-
-  await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
-  await page.close();
-}
-
-
-async function ngOpenMediaManager(page) {
-  const mediaUrl = `${NG_BASE}/media-manager`;
-  await page.goto(mediaUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
-  await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
-}
-
-async function ngSearch(page, phone, dateFrom, dateTo) {
-  // Fill date range if inputs exist
-  if (dateFrom) {
-    await page.fill('input[name="from"], input[placeholder*="From"]', dateFrom).catch(() => {});
-  }
-  if (dateTo) {
-    await page.fill('input[name="to"], input[placeholder*="To"]', dateTo).catch(() => {});
-  }
-
-  // Fill the Number box (label is “Number”)
-  await page.fill(
-    'input[name="number"], input[aria-label="Number"], input[placeholder*="Number"]',
-    phone
-  ).catch(() => {});
-
-  // Click SEARCH
-  const searchBtn = page.getByRole('button', { name: /search/i });
-  if (await searchBtn.count()) {
-    await Promise.all([
-      page.waitForLoadState('networkidle').catch(() => {}),
-      searchBtn.click()
-    ]);
-  } else {
-    await Promise.all([
-      page.waitForLoadState('networkidle').catch(() => {}),
-      page.click('button:has-text("SEARCH"), input[type="submit"][value*="SEARCH" i]').catch(() => {})
-    ]);
-  }
-
-  // Wait for the results table to render rows
-  const resultsTable = page.locator('table').filter({
-    has: page.locator('th', { hasText: /caller/i })
-  }).first();
-
-  await resultsTable.waitFor({ timeout: 15000 }).catch(() => {});
-  await resultsTable.locator('tbody tr').first().waitFor({ timeout: 15000 }).catch(() => {});
-}
-
-
-// Returns { rowHandle, downloadLinkHandle } or null
-async function ngFindFirstRowWithCaller(page, phone) {
-  const want = normalizePhoneForMatch(phone);
-
-  // Find the *results* table by its header (“Caller”)
-  const table = page.locator('table').filter({
-    has: page.locator('th', { hasText: /caller/i })
-  }).first();
-
-  // Ensure it exists and has some rows
-  await table.waitFor({ timeout: 15000 });
-
-  const rows = table.locator('tbody tr');
-  const count = await rows.count();
-
-  // Optional debug logs (uncomment if you need to see what we see)
-  // console.log('[ng-download] rows in results table:', count);
-
-  for (let i = 0; i < count; i++) {
-    const row = rows.nth(i);
-
-    // Caller column is the 2nd column in your screenshot
-    const callerCell = row.locator('td').nth(1); // 0-based index => 2nd column
-    const text = ((await callerCell.innerText().catch(() => '')) || '').trim();
-    const digits = text.replace(/[^\d]/g, '');
-
-    // console.log(`[ng-download] row ${i} caller raw="${text}" digits="${digits}"`);
-
-    if (digits && digits.includes(want)) {
-      // Find the DOWNLOAD link within this row
-      const downloadLink = row.locator('a', { hasText: /download/i }).first();
-      if (await downloadLink.count()) {
-        return { rowHandle: row, downloadLinkHandle: downloadLink };
-      }
-    }
-  }
-
-  return null;
-}
-
-
-async function ngDownloadFirstMatch(context, page, phone, dateFrom, dateTo) {
-  await ngOpenMediaManager(page);
-  await ngSearch(page, phone, dateFrom, dateTo);
-
-  const hit = await ngFindFirstRowWithCaller(page, phone);
-  if (!hit) throw new Error('No matching row with that caller number');
-
-  const [ download ] = await Promise.all([
-    page.waitForEvent('download', { timeout: 30000 }),
-    hit.downloadLinkHandle.click()
-  ]);
-
-  const suggested = download.suggestedFilename();
-  const maybePath = await download.path();
-  const mimeType = download.mimeType?.() || 'application/octet-stream';
-
-  let filePath = maybePath;
-  if (!filePath) {
-    const tmpPath = `/tmp/${Date.now()}_${suggested || 'recording'}`;
-    await download.saveAs(tmpPath);
-    filePath = tmpPath;
-  }
-
-  const buf = fs.readFileSync(filePath);
-  const base64 = buf.toString('base64');
-
-  return {
-    filename: suggested || `recording_${Date.now()}`,
-    mimeType,
-    size: buf.length,
-    base64
-  };
 }
 
 // ---------- Health ----------
@@ -523,73 +376,6 @@ app.post('/run-task', async (req, res) => {
     } catch (err) {
       log('ERROR(extract-contact):', err.message);
       return res.status(500).json({ error: err.message, where: 'extract-contact' });
-    }
-  }
-
-  // ===== Numbergroup: NG-DOWNLOAD =====
-  if (task === 'ng-download') {
-    const { phone, dateFrom, dateTo } = req.body || {};
-    if (!phone) return res.status(400).json({ error: 'phone is required' });
-    if (!NG_USER || !NG_PASS) return res.status(400).json({ error: 'NG_USER/NG_PASS not set' });
-
-    const dr = defaultDateRange();
-    const df = dateFrom || dr.from;
-    const dt = dateTo   || dr.to;
-
-    const browser = await chromium.launch({ headless: true });
-    let context;
-    try {
-      const hasState = NG_STATE && fs.existsSync(NG_STATE);
-      context = hasState
-        ? await browser.newContext({
-            storageState: NG_STATE,
-            acceptDownloads: true,
-            userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
-            locale: "en-GB"
-          })
-        : await browser.newContext({
-            acceptDownloads: true,
-            userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
-            locale: "en-GB"
-          });
-
-      await ngLogin(context);
-      if (NG_STATE && !hasState) {
-        await context.storageState({ path: NG_STATE });
-      }
-
-      const page = await context.newPage();
-      const file = await ngDownloadFirstMatch(context, page, phone, df, dt);
-
-      const result = {
-        ok: true,
-        requestedPhone: phone,
-        ...file,
-        sourceUrl: `${NG_BASE}/media-manager`,
-        dateFrom: df,
-        dateTo: dt
-      };
-
-      const endpoint = req.body.callbackUrl || CALLBACK_URL;
-      if (endpoint) {
-        try {
-          await fetch(endpoint, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(result)
-          });
-        } catch (e) {
-          console.log('[ng-download] callback failed:', e.message);
-        }
-      }
-
-      return res.json(result);
-    } catch (err) {
-      console.error('[ng-download] ERROR:', err);
-      return res.status(500).json({ error: err.message, where: 'ng-download' });
-    } finally {
-      try { if (context) await context.close(); } catch {}
-      await browser.close();
     }
   }
 
