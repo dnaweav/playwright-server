@@ -165,7 +165,7 @@ async function findFirstPhoneOnPage(page, timeoutMs = 15000) {
 }
 
 // EMAIL: lead panel first, then body, then HTML; exclude login/service emails
-async function findFirstEmailOnPage(page, timeoutMs = 15000) {
+async function findFirstEmailOnPage(page, timeoutMs = 15001) {
   const deadline = Date.now() + timeoutMs;
 
   // 1) Lead panel
@@ -339,7 +339,7 @@ app.post('/run-task', async (req, res) => {
     }
   }
 
-  // ----- Advanced: EXTRACT-CONTACT (phone + email) -----
+  // ----- Advanced: EXTRACT-CONTACT (phone + emails) -----
   if (task === 'extract-contact') {
     if (!url) return res.status(400).json({ error: 'url is required' });
 
