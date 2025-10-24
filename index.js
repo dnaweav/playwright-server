@@ -1,116 +1,71 @@
-// playwright_scraper_fixed/index.js
-// Cleaned-up and debug-friendly Playwright scraper
-
-require('dotenv').config();
-
 const express = require('express');
 const { chromium } = require('playwright');
-const fs = require('fs');
-const nodemailer = require('nodemailer');
+const dotenv = require('dotenv');
+const axios = require('axios');
+dotenv.config();
 
 const app = express();
 app.use(express.json());
 
-const API_TOKEN = process.env.API_TOKEN;
-const GUSER = process.env.GOOGLE_USER || "";
-const GPASS = process.env.GOOGLE_PASS || "";
-const CALLBACK_URL = process.env.CALLBACK_URL || "";
-const STATE_PATH = '/tmp/google-state.json';
-const EMAIL_RECIPIENT = process.env.ALERT_EMAIL || 'adrentleads@gmail.com';
+const WEBHOOK_URL = 'https://hook.eu2.make.com/53k63zyavw86zmgpf50ilu864ul4zr0b';
 
-const EXCLUDE_EMAILS = (process.env.EXCLUDE_EMAILS || '').split(',').map(s => s.trim().toLowerCase());
-const BLOCKED_PHONES = ["020 3519 9816", ...(process.env.BLOCKED_PHONES || '').split(',')].map(p => p.trim());
-const BLOCKED_SET = new Set(BLOCKED_PHONES.map(p => normalizePhoneForCompare(p)));
-
-const UK_PHONE_REGEX_GLOBAL = /\b(?:\+44\s?\d(?:[\s-]?\d){8,9}|07(?:[\s-]?\d){9}|0[12](?:[\s-]?\d){8,9})\b/g;
-const EMAIL_REGEX_GLOBAL = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g;
-
-function normalizePhoneForCompare(p = '') {
-  const digits = p.replace(/\D/g, '');
-  return digits.startsWith('44') ? '0' + digits.slice(2) : digits;
+async function sendErrorToWebhook(error, context = '') {
+  try {
+    await axios.post(WEBHOOK_URL, {
+      timestamp: new Date().toISOString(),
+      message: error.message,
+      stack: error.stack,
+      context,
+    });
+  } catch (err) {
+    console.error('Failed to send error to webhook:', err.message);
+  }
 }
 
-function isServiceEmail(email) {
-  return ["google.com", "gstatic.com"].some(domain => email.endsWith(domain));
-}
+async function extractContact(url) {
+  const browser = await chromium.launch({ headless: true });
+  const context = await browser.newContext();
+  const page = await context.newPage();
 
-function isExcludedEmail(email) {
-  return EXCLUDE_EMAILS.includes(email.toLowerCase()) || email.toLowerCase() === GUSER.toLowerCase();
-}
+  try {
+    await page.goto(url, { timeout: 60000 });
 
-async function loginGoogle(page) {
-  await page.goto('https://accounts.google.com/');
-  await page.locator('input[type="email"]').fill(GUSER);
-  await page.click('#identifierNext');
-  await page.waitForTimeout(2000);
-  await page.locator('input[type="password"]').fill(GPASS);
-  await page.click('#passwordNext');
-  await page.waitForLoadState('networkidle');
-  await page.context().storageState({ path: STATE_PATH });
-}
+    const content = await page.content();
 
-async function findPhone(page) {
-  const title = await page.title();
-  const header = await page.evaluate(() => {
-    return Array.from(document.querySelectorAll('*')).filter(el => {
-      const styles = window.getComputedStyle(el);
-      return styles.position === 'fixed' || styles.position === 'sticky';
-    }).map(el => el.innerText).join("\n");
-  });
-  const body = await page.evaluate(() => document.body.innerText);
-  const allText = `${title}\n${header}\n${body}`;
-  const match = allText.match(UK_PHONE_REGEX_GLOBAL) || [];
-  return match.find(p => !BLOCKED_SET.has(normalizePhoneForCompare(p))) || "Required";
-}
+    const number = await page.evaluate(() => {
+      const span = [...document.querySelectorAll('span')]
+        .find(el => /\d{5}\s?\d{6}/.test(el.textContent));
+      return span ? span.textContent.trim() : null;
+    });
 
-async function findEmail(page) {
-  const html = await page.content();
-  const emails = html.match(EMAIL_REGEX_GLOBAL) || [];
-  const valid = emails.filter(e => !isServiceEmail(e) && !isExcludedEmail(e));
-  return valid[0] || "Required";
-}
+    if (!number) {
+      throw new Error('Phone number not found on the page');
+    }
 
-function sendErrorEmail(subject, message) {
-  if (!EMAIL_RECIPIENT) return;
-  const transporter = nodemailer.createTransport({ sendmail: true });
-  transporter.sendMail({ from: 'scraper@adrentleads.com', to: EMAIL_RECIPIENT, subject, text: message });
+    await browser.close();
+    return number;
+
+  } catch (error) {
+    await browser.close();
+    await sendErrorToWebhook(error, `Failed to extract contact from URL: ${url}`);
+    throw error;
+  }
 }
 
 app.post('/run-task', async (req, res) => {
-  if (req.headers.authorization?.split(' ')[1] !== API_TOKEN) {
-    return res.status(403).json({ error: 'Unauthorized' });
-  }
-
   const { task, url } = req.body;
-  if (!task || !url) return res.status(400).json({ error: 'Missing task or URL' });
 
-  const browser = await chromium.launch();
-  const context = fs.existsSync(STATE_PATH)
-    ? await browser.newContext({ storageState: STATE_PATH })
-    : await browser.newContext();
-
-  const page = await context.newPage();
   try {
-    await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
-
-    if (!fs.existsSync(STATE_PATH) && GUSER && GPASS) await loginGoogle(page);
-
-    const result = { ok: true, sourceUrl: url };
-    if (task === 'extract-phone') result.phone = await findPhone(page);
-    else if (task === 'extract-email') result.email = await findEmail(page);
-    else if (task === 'extract-contact') {
-      result.phone = await findPhone(page);
-      result.email = await findEmail(page);
-      result.ok = result.phone !== 'Required' || result.email !== 'Required';
+    if (task === 'extract-contact') {
+      const result = await extractContact(url);
+      return res.status(200).json({ success: true, phone: result });
     }
-    else throw new Error(`Unknown task: ${task}`);
 
-    res.json(result);
-  } catch (err) {
-    sendErrorEmail(`Scraper failed: ${task}`, `${err.message}\n\nURL: ${url}`);
-    res.status(500).json({ error: err.message });
-  } finally {
-    await browser.close();
+    return res.status(400).json({ error: `Unsupported task: ${task}` });
+
+  } catch (error) {
+    await sendErrorToWebhook(error, `Failed /run-task with task: ${task}`);
+    return res.status(500).json({ success: false, error: error.message });
   }
 });
 
