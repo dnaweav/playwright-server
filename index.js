@@ -1,5 +1,5 @@
 // index.js
-// Playwright MCP-style micro-API for Make.com with email error alerts
+// Playwright MCP-style micro-API for Make.com with email notifications and improved phone scraping
 
 try { require('dotenv').config(); } catch {}
 
@@ -11,39 +11,12 @@ const nodemailer = require('nodemailer');
 const app = express();
 app.use(express.json());
 
-// ---------- Config ----------
 const API_TOKEN     = process.env.API_TOKEN;
 const GUSER         = process.env.GOOGLE_USER || "";
 const GPASS         = process.env.GOOGLE_PASS || "";
 const CALLBACK_URL  = process.env.CALLBACK_URL || "";
 const STATE_PATH    = '/tmp/google-state.json';
-
-const EMAIL_USER = process.env.EMAIL_USER;
-const EMAIL_PASS = process.env.EMAIL_PASS;
-
-const transporter = nodemailer.createTransport({
-  service: 'gmail',
-  auth: {
-    user: EMAIL_USER,
-    pass: EMAIL_PASS,
-  },
-});
-
-function sendErrorEmail(task, url, err) {
-  const mailOptions = {
-    from: EMAIL_USER,
-    to: 'adrentleads@gmail.com',
-    subject: `Playwright Error - Task: ${task}`,
-    text: `Task: ${task}\nURL: ${url}\nError: ${err.message || err}`,
-  };
-  transporter.sendMail(mailOptions, (error, info) => {
-    if (error) {
-      console.error('Email failed:', error.message);
-    } else {
-      console.log('Email sent:', info.response);
-    }
-  });
-}
+const NOTIFY_EMAIL  = 'adrentleads@gmail.com';
 
 const EXCLUDE_EMAILS = (process.env.EXCLUDE_EMAILS || '')
   .split(',')
@@ -86,7 +59,10 @@ const BLOCKED_PHONES = [
   "020 3519 2748", "0247 7411008", "0203 5193564", "01442935082",
   "0203 6700435", "020 3519 9193", "01784 656042", "01726 420021",
   "01904 378049", "01392 243076", "020 3677 0465",
-  ...(process.env.BLOCKED_PHONES || "").split(",").map(s => s.trim()).filter(Boolean)
+  ...(process.env.BLOCKED_PHONES || "")
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean)
 ];
 
 function normalizePhoneForCompare(p = "") {
@@ -103,13 +79,11 @@ async function getLeadPanelText(page) {
     const candidates = [];
     const main = document.querySelector('[role="main"]');
     if (main) candidates.push(main);
-
     const all = Array.from(document.querySelectorAll('div, section, main'));
     for (const el of all) {
       const t = (el.innerText || '').toLowerCase();
       if (t.includes('lead summary') || t.includes('conversation')) candidates.push(el);
     }
-
     let best = '';
     for (const el of candidates) {
       const text = (el.innerText || '').trim();
@@ -126,37 +100,45 @@ async function loginGoogle(page) {
   await email.fill(GUSER);
   await Promise.all([
     page.waitForLoadState('domcontentloaded').catch(() => {}),
-    page.locator('#identifierNext, button:has-text("Next"), div[role="button"]:has-text("Next")').click()
+    page.locator('#identifierNext, button:has-text("Next")').click()
   ]);
   const pass = page.locator('input[type="password"], input[name="Passwd"]');
   await pass.waitFor({ timeout: 30000 });
   await pass.fill(GPASS);
   await Promise.all([
     page.waitForLoadState('networkidle').catch(() => {}),
-    page.locator('#passwordNext, button:has-text("Next"), div[role="button"]:has-text("Next")').click()
+    page.locator('#passwordNext, button:has-text("Next")').click()
   ]);
 }
 
 async function findFirstPhoneOnPage(page, timeoutMs = 15000) {
   const deadline = Date.now() + timeoutMs;
-  const pickFirstAllowed = (arr) => {
-    for (const raw of arr || []) {
-      if (!BLOCKED_SET.has(normalizePhoneForCompare(raw))) return raw;
-    }
-    return null;
-  };
+  const pickFirstAllowed = (arr) => (arr || []).find(raw => !BLOCKED_SET.has(normalizePhoneForCompare(raw)));
+
+  const title = await page.title();
+  const titleMatch = pickFirstAllowed(title.match(UK_PHONE_REGEX_GLOBAL));
+  if (titleMatch) return titleMatch;
+
+  const headerText = await page.evaluate(() => {
+    const headerEls = Array.from(document.querySelectorAll('*'))
+      .filter(el => ['fixed', 'sticky'].includes(getComputedStyle(el).position));
+    return headerEls.map(el => el.innerText || '').join('\n');
+  });
+  const headerMatch = pickFirstAllowed(headerText.match(UK_PHONE_REGEX_GLOBAL));
+  if (headerMatch) return headerMatch;
+
   while (Date.now() < deadline) {
     const text = await page.evaluate(() => document.body?.innerText || '');
     const match = pickFirstAllowed(text.match(UK_PHONE_REGEX_GLOBAL));
     if (match) return match;
     await page.waitForTimeout(500);
   }
+
   const html = await page.content();
-  const srcMatch = pickFirstAllowed(html.match(UK_PHONE_REGEX_GLOBAL));
-  return srcMatch || null;
+  return pickFirstAllowed(html.match(UK_PHONE_REGEX_GLOBAL));
 }
 
-async function findFirstEmailOnPage(page, timeoutMs = 15001) {
+async function findFirstEmailOnPage(page, timeoutMs = 15000) {
   const deadline = Date.now() + timeoutMs;
   const leadText = (await getLeadPanelText(page)) || '';
   const panelMatches = (leadText.match(EMAIL_REGEX_GLOBAL) || [])
@@ -170,10 +152,29 @@ async function findFirstEmailOnPage(page, timeoutMs = 15001) {
     if (matches.length) return matches[0];
     await page.waitForTimeout(500);
   }
+
   const html = await page.content();
   const srcMatches = (html.match(EMAIL_REGEX_GLOBAL) || [])
     .filter(e => !isServiceEmail(e) && !isExcludedEmail(e));
   return srcMatches[0] || null;
+}
+
+async function sendErrorEmail(task, url, err) {
+  if (!NOTIFY_EMAIL) return;
+
+  const transporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: { user: GUSER, pass: GPASS },
+  });
+
+  const info = await transporter.sendMail({
+    from: `Playwright Error <${GUSER}>`,
+    to: NOTIFY_EMAIL,
+    subject: `Error: Task ${task}`,
+    text: `Failed task: ${task}\nURL: ${url}\nError: ${err.message}`,
+  });
+
+  console.log('Email sent:', info.messageId);
 }
 
 app.get('/', (_, res) => res.send('OK'));
@@ -184,9 +185,9 @@ app.post('/run-task', async (req, res) => {
   if (!API_TOKEN || token !== API_TOKEN) {
     return res.status(403).json({ error: 'Not allowed' });
   }
+
   const { task, url, callbackUrl } = req.body || {};
   if (!task) return res.status(400).json({ error: 'task is required' });
-
   const log = (...a) => console.log(`[run-task][${task}]`, ...a);
 
   async function withContext(run) {
@@ -198,6 +199,7 @@ app.post('/run-task', async (req, res) => {
         ? await browser.newContext({ storageState: STATE_PATH })
         : await browser.newContext();
       const page = await context.newPage();
+
       const cookies = await context.cookies();
       const hasGoogleCookie = cookies.some(c => c.domain.includes('google'));
       log('hasState', hasState, 'hasGoogleCookie', hasGoogleCookie);
@@ -213,6 +215,7 @@ app.post('/run-task', async (req, res) => {
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
       await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {});
       await page.waitForTimeout(1000);
+
       return await run(page);
     } finally {
       try { if (context) await context.close(); } catch {}
@@ -222,20 +225,20 @@ app.post('/run-task', async (req, res) => {
 
   if (task === 'extract-contact') {
     if (!url) return res.status(400).json({ error: 'url is required' });
+
     try {
       const result = await withContext(async (page) => {
         const bodyText = await page.evaluate(() => document.body?.innerText || '');
-        let phone = "Required";
-        if (!/no phone number/i.test(bodyText)) {
-          phone = (await findFirstPhoneOnPage(page, 15000)) || "Required";
-        }
-        const email = (await findFirstEmailOnPage(page, 15000)) || "Required";
+        let phone = /no phone number/i.test(bodyText) ? "Required" : (await findFirstPhoneOnPage(page)) || "Required";
+        const email = (await findFirstEmailOnPage(page)) || "Required";
+
         const payload = {
           ok: phone !== "Required" || email !== "Required",
           phone,
           email,
           sourceUrl: url
         };
+
         const endpoint = callbackUrl || CALLBACK_URL;
         if (endpoint) {
           try {
@@ -245,14 +248,16 @@ app.post('/run-task', async (req, res) => {
               body: JSON.stringify(payload)
             });
             log('callback posted to', endpoint);
-          } catch (e) { log('WARN(callback failed):', e.message); }
+          } catch (e) {
+            log('WARN(callback failed):', e.message);
+          }
         }
         return payload;
       });
       return res.json(result);
     } catch (err) {
       log('ERROR(extract-contact):', err.message);
-      sendErrorEmail(task, url, err);
+      await sendErrorEmail(task, url, err);
       return res.status(500).json({ error: err.message, where: 'extract-contact' });
     }
   }
