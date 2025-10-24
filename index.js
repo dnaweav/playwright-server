@@ -1,7 +1,7 @@
-// index.js
-// Playwright MCP-style micro-API for Make.com with email notifications and improved phone scraping
+// playwright_scraper_fixed/index.js
+// Cleaned-up and debug-friendly Playwright scraper
 
-try { require('dotenv').config(); } catch {}
+require('dotenv').config();
 
 const express = require('express');
 const { chromium } = require('playwright');
@@ -11,258 +11,107 @@ const nodemailer = require('nodemailer');
 const app = express();
 app.use(express.json());
 
-const API_TOKEN     = process.env.API_TOKEN;
-const GUSER         = process.env.GOOGLE_USER || "";
-const GPASS         = process.env.GOOGLE_PASS || "";
-const CALLBACK_URL  = process.env.CALLBACK_URL || "";
-const STATE_PATH    = '/tmp/google-state.json';
-const NOTIFY_EMAIL  = 'adrentleads@gmail.com';
+const API_TOKEN = process.env.API_TOKEN;
+const GUSER = process.env.GOOGLE_USER || "";
+const GPASS = process.env.GOOGLE_PASS || "";
+const CALLBACK_URL = process.env.CALLBACK_URL || "";
+const STATE_PATH = '/tmp/google-state.json';
+const EMAIL_RECIPIENT = process.env.ALERT_EMAIL || 'adrentleads@gmail.com';
 
-const EXCLUDE_EMAILS = (process.env.EXCLUDE_EMAILS || '')
-  .split(',')
-  .map(s => s.trim().toLowerCase())
-  .filter(Boolean);
+const EXCLUDE_EMAILS = (process.env.EXCLUDE_EMAILS || '').split(',').map(s => s.trim().toLowerCase());
+const BLOCKED_PHONES = ["020 3519 9816", ...(process.env.BLOCKED_PHONES || '').split(',')].map(p => p.trim());
+const BLOCKED_SET = new Set(BLOCKED_PHONES.map(p => normalizePhoneForCompare(p)));
 
-try {
-  if (process.env.GOOGLE_STATE_B64 && !fs.existsSync(STATE_PATH)) {
-    fs.writeFileSync(STATE_PATH, Buffer.from(process.env.GOOGLE_STATE_B64, 'base64'));
-    console.log('Seeded Google storage state to', STATE_PATH);
-  }
-} catch (e) {
-  console.log('WARN: could not seed GOOGLE_STATE_B64:', e.message);
+const UK_PHONE_REGEX_GLOBAL = /\b(?:\+44\s?\d(?:[\s-]?\d){8,9}|07(?:[\s-]?\d){9}|0[12](?:[\s-]?\d){8,9})\b/g;
+const EMAIL_REGEX_GLOBAL = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g;
+
+function normalizePhoneForCompare(p = '') {
+  const digits = p.replace(/\D/g, '');
+  return digits.startsWith('44') ? '0' + digits.slice(2) : digits;
 }
 
-const UK_PHONE_REGEX_GLOBAL =
-  /\b(?:\+44\s?\d(?:[\s-]?\d){8,9}|07(?:[\s-]?\d){9}|0[12](?:[\s-]?\d){8,9})\b/g;
-
-const EMAIL_REGEX_GLOBAL =
-  /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g;
-
-const SERVICE_EMAIL_DOMAINS = [
-  'google.com', 'gstatic.com', 'googlemail.com', 'corp.google.com',
-  'adwords.corp.google.com', 'awx-sab-debug.corp.google.com'
-];
-
 function isServiceEmail(email) {
-  const domain = email.split('@')[1]?.toLowerCase() || '';
-  return SERVICE_EMAIL_DOMAINS.some(d => domain.endsWith(d));
+  return ["google.com", "gstatic.com"].some(domain => email.endsWith(domain));
 }
 
 function isExcludedEmail(email) {
-  const e = (email || '').toLowerCase();
-  if (GUSER && e === GUSER.toLowerCase()) return true;
-  return EXCLUDE_EMAILS.includes(e);
-}
-
-const BLOCKED_PHONES = [
-  "020 3519 9816", "01872 465067", "020 3519 9325", "07491 786550",
-  "020 3519 2748", "0247 7411008", "0203 5193564", "01442935082",
-  "0203 6700435", "020 3519 9193", "01784 656042", "01726 420021",
-  "01904 378049", "01392 243076", "020 3677 0465",
-  ...(process.env.BLOCKED_PHONES || "")
-    .split(",")
-    .map(s => s.trim())
-    .filter(Boolean)
-];
-
-function normalizePhoneForCompare(p = "") {
-  const digits = String(p).replace(/\D/g, "");
-  if (digits.startsWith("44") && digits.length >= 10) {
-    return "0" + digits.slice(2);
-  }
-  return digits;
-}
-const BLOCKED_SET = new Set(BLOCKED_PHONES.map(normalizePhoneForCompare));
-
-async function getLeadPanelText(page) {
-  return await page.evaluate(() => {
-    const candidates = [];
-    const main = document.querySelector('[role="main"]');
-    if (main) candidates.push(main);
-    const all = Array.from(document.querySelectorAll('div, section, main'));
-    for (const el of all) {
-      const t = (el.innerText || '').toLowerCase();
-      if (t.includes('lead summary') || t.includes('conversation')) candidates.push(el);
-    }
-    let best = '';
-    for (const el of candidates) {
-      const text = (el.innerText || '').trim();
-      if (text && text.length > best.length) best = text;
-    }
-    return best;
-  });
+  return EXCLUDE_EMAILS.includes(email.toLowerCase()) || email.toLowerCase() === GUSER.toLowerCase();
 }
 
 async function loginGoogle(page) {
-  await page.goto('https://accounts.google.com/', { waitUntil: 'domcontentloaded' });
-  const email = page.locator('input[type="email"], input[name="identifier"]');
-  await email.waitFor({ timeout: 20000 });
-  await email.fill(GUSER);
-  await Promise.all([
-    page.waitForLoadState('domcontentloaded').catch(() => {}),
-    page.locator('#identifierNext, button:has-text("Next")').click()
-  ]);
-  const pass = page.locator('input[type="password"], input[name="Passwd"]');
-  await pass.waitFor({ timeout: 30000 });
-  await pass.fill(GPASS);
-  await Promise.all([
-    page.waitForLoadState('networkidle').catch(() => {}),
-    page.locator('#passwordNext, button:has-text("Next")').click()
-  ]);
+  await page.goto('https://accounts.google.com/');
+  await page.locator('input[type="email"]').fill(GUSER);
+  await page.click('#identifierNext');
+  await page.waitForTimeout(2000);
+  await page.locator('input[type="password"]').fill(GPASS);
+  await page.click('#passwordNext');
+  await page.waitForLoadState('networkidle');
+  await page.context().storageState({ path: STATE_PATH });
 }
 
-async function findFirstPhoneOnPage(page, timeoutMs = 15000) {
-  const deadline = Date.now() + timeoutMs;
-  const pickFirstAllowed = (arr) => (arr || []).find(raw => !BLOCKED_SET.has(normalizePhoneForCompare(raw)));
-
+async function findPhone(page) {
   const title = await page.title();
-  const titleMatch = pickFirstAllowed(title.match(UK_PHONE_REGEX_GLOBAL));
-  if (titleMatch) return titleMatch;
-
-  const headerText = await page.evaluate(() => {
-    const headerEls = Array.from(document.querySelectorAll('*'))
-      .filter(el => ['fixed', 'sticky'].includes(getComputedStyle(el).position));
-    return headerEls.map(el => el.innerText || '').join('\n');
+  const header = await page.evaluate(() => {
+    return Array.from(document.querySelectorAll('*')).filter(el => {
+      const styles = window.getComputedStyle(el);
+      return styles.position === 'fixed' || styles.position === 'sticky';
+    }).map(el => el.innerText).join("\n");
   });
-  const headerMatch = pickFirstAllowed(headerText.match(UK_PHONE_REGEX_GLOBAL));
-  if (headerMatch) return headerMatch;
+  const body = await page.evaluate(() => document.body.innerText);
+  const allText = `${title}\n${header}\n${body}`;
+  const match = allText.match(UK_PHONE_REGEX_GLOBAL) || [];
+  return match.find(p => !BLOCKED_SET.has(normalizePhoneForCompare(p))) || "Required";
+}
 
-  while (Date.now() < deadline) {
-    const text = await page.evaluate(() => document.body?.innerText || '');
-    const match = pickFirstAllowed(text.match(UK_PHONE_REGEX_GLOBAL));
-    if (match) return match;
-    await page.waitForTimeout(500);
-  }
-
+async function findEmail(page) {
   const html = await page.content();
-  return pickFirstAllowed(html.match(UK_PHONE_REGEX_GLOBAL));
+  const emails = html.match(EMAIL_REGEX_GLOBAL) || [];
+  const valid = emails.filter(e => !isServiceEmail(e) && !isExcludedEmail(e));
+  return valid[0] || "Required";
 }
 
-async function findFirstEmailOnPage(page, timeoutMs = 15000) {
-  const deadline = Date.now() + timeoutMs;
-  const leadText = (await getLeadPanelText(page)) || '';
-  const panelMatches = (leadText.match(EMAIL_REGEX_GLOBAL) || [])
-    .filter(e => !isServiceEmail(e) && !isExcludedEmail(e));
-  if (panelMatches.length) return panelMatches[0];
-
-  while (Date.now() < deadline) {
-    const text = await page.evaluate(() => document.body?.innerText || '');
-    const matches = (text.match(EMAIL_REGEX_GLOBAL) || [])
-      .filter(e => !isServiceEmail(e) && !isExcludedEmail(e));
-    if (matches.length) return matches[0];
-    await page.waitForTimeout(500);
-  }
-
-  const html = await page.content();
-  const srcMatches = (html.match(EMAIL_REGEX_GLOBAL) || [])
-    .filter(e => !isServiceEmail(e) && !isExcludedEmail(e));
-  return srcMatches[0] || null;
+function sendErrorEmail(subject, message) {
+  if (!EMAIL_RECIPIENT) return;
+  const transporter = nodemailer.createTransport({ sendmail: true });
+  transporter.sendMail({ from: 'scraper@adrentleads.com', to: EMAIL_RECIPIENT, subject, text: message });
 }
-
-async function sendErrorEmail(task, url, err) {
-  if (!NOTIFY_EMAIL) return;
-
-  const transporter = nodemailer.createTransport({
-    service: 'gmail',
-    auth: { user: GUSER, pass: GPASS },
-  });
-
-  const info = await transporter.sendMail({
-    from: `Playwright Error <${GUSER}>`,
-    to: NOTIFY_EMAIL,
-    subject: `Error: Task ${task}`,
-    text: `Failed task: ${task}\nURL: ${url}\nError: ${err.message}`,
-  });
-
-  console.log('Email sent:', info.messageId);
-}
-
-app.get('/', (_, res) => res.send('OK'));
-app.get('/healthz', (_, res) => res.json({ ok: true }));
 
 app.post('/run-task', async (req, res) => {
-  const token = req.headers.authorization?.split(' ')[1] || '';
-  if (!API_TOKEN || token !== API_TOKEN) {
-    return res.status(403).json({ error: 'Not allowed' });
+  if (req.headers.authorization?.split(' ')[1] !== API_TOKEN) {
+    return res.status(403).json({ error: 'Unauthorized' });
   }
 
-  const { task, url, callbackUrl } = req.body || {};
-  if (!task) return res.status(400).json({ error: 'task is required' });
-  const log = (...a) => console.log(`[run-task][${task}]`, ...a);
+  const { task, url } = req.body;
+  if (!task || !url) return res.status(400).json({ error: 'Missing task or URL' });
 
-  async function withContext(run) {
-    const browser = await chromium.launch({ headless: true });
-    let context;
-    try {
-      const hasState = fs.existsSync(STATE_PATH);
-      context = hasState
-        ? await browser.newContext({ storageState: STATE_PATH })
-        : await browser.newContext();
-      const page = await context.newPage();
+  const browser = await chromium.launch();
+  const context = fs.existsSync(STATE_PATH)
+    ? await browser.newContext({ storageState: STATE_PATH })
+    : await browser.newContext();
 
-      const cookies = await context.cookies();
-      const hasGoogleCookie = cookies.some(c => c.domain.includes('google'));
-      log('hasState', hasState, 'hasGoogleCookie', hasGoogleCookie);
+  const page = await context.newPage();
+  try {
+    await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
 
-      if (!hasGoogleCookie && GUSER && GPASS && !hasState) {
-        log('Attempting fallback login...');
-        await loginGoogle(page);
-        await context.storageState({ path: STATE_PATH });
-        log('Login complete; state saved');
-      }
+    if (!fs.existsSync(STATE_PATH) && GUSER && GPASS) await loginGoogle(page);
 
-      log('goto', url);
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-      await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {});
-      await page.waitForTimeout(1000);
-
-      return await run(page);
-    } finally {
-      try { if (context) await context.close(); } catch {}
-      await browser.close();
+    const result = { ok: true, sourceUrl: url };
+    if (task === 'extract-phone') result.phone = await findPhone(page);
+    else if (task === 'extract-email') result.email = await findEmail(page);
+    else if (task === 'extract-contact') {
+      result.phone = await findPhone(page);
+      result.email = await findEmail(page);
+      result.ok = result.phone !== 'Required' || result.email !== 'Required';
     }
+    else throw new Error(`Unknown task: ${task}`);
+
+    res.json(result);
+  } catch (err) {
+    sendErrorEmail(`Scraper failed: ${task}`, `${err.message}\n\nURL: ${url}`);
+    res.status(500).json({ error: err.message });
+  } finally {
+    await browser.close();
   }
-
-  if (task === 'extract-contact') {
-    if (!url) return res.status(400).json({ error: 'url is required' });
-
-    try {
-      const result = await withContext(async (page) => {
-        const bodyText = await page.evaluate(() => document.body?.innerText || '');
-        let phone = /no phone number/i.test(bodyText) ? "Required" : (await findFirstPhoneOnPage(page)) || "Required";
-        const email = (await findFirstEmailOnPage(page)) || "Required";
-
-        const payload = {
-          ok: phone !== "Required" || email !== "Required",
-          phone,
-          email,
-          sourceUrl: url
-        };
-
-        const endpoint = callbackUrl || CALLBACK_URL;
-        if (endpoint) {
-          try {
-            await fetch(endpoint, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(payload)
-            });
-            log('callback posted to', endpoint);
-          } catch (e) {
-            log('WARN(callback failed):', e.message);
-          }
-        }
-        return payload;
-      });
-      return res.json(result);
-    } catch (err) {
-      log('ERROR(extract-contact):', err.message);
-      await sendErrorEmail(task, url, err);
-      return res.status(500).json({ error: err.message, where: 'extract-contact' });
-    }
-  }
-
-  return res.status(400).json({ error: `Unsupported task: ${task}` });
 });
 
 const PORT = process.env.PORT || 3000;
