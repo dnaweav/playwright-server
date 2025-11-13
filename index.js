@@ -1,88 +1,48 @@
-const express = require('express');
-const { chromium } = require('playwright');
-const dotenv = require('dotenv');
-const axios = require('axios');
-const fs = require('fs');
-dotenv.config();
+// index.js
+import express from 'express';
+import { chromium } from 'playwright';
+import fs from 'fs/promises';
 
 const app = express();
 app.use(express.json());
 
-const WEBHOOK_URL = 'https://hook.eu2.make.com/53k63zyavw86zmgpf50ilu864ul4zr0b';
+const EXCLUDED_NUMBERS = new Set([
+  '02035199816', '01872465067', '02035199325', '07491786550',
+  '02035192748', '02477411008', '01442935082', '02036700435',
+  '01726420021', '01904378049', '02035199193', '01784656042',
+  '01392243076', '02036770465', '02035193564'
+]);
 
-async function sendErrorToWebhook(error, context = '', screenshot = null) {
-  try {
-    const payload = {
-      timestamp: new Date().toISOString(),
-      message: error.message,
-      stack: error.stack,
-      context,
-    };
-    if (screenshot) {
-      payload.screenshot = screenshot;
-    }
-    await axios.post(WEBHOOK_URL, payload);
-  } catch (err) {
-    console.error('Failed to send error to webhook:', err.message);
-  }
-}
-
-async function extractContact(url) {
-  const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext();
-  const page = await context.newPage();
-
-  try {
-    await page.goto(url, { timeout: 60000 });
-
-    const screenshotBuffer = await page.screenshot({ fullPage: true });
-    const screenshotBase64 = screenshotBuffer.toString('base64');
-
-    const content = await page.content();
-    const phoneRegex = /\b(?:\+44\s?\d{4}|0\d{4}|0\d{3})\s?\d{3}\s?\d{3}\b/g;
-    const matches = content.match(phoneRegex) || [];
-
-    const blocklist = [
-      "020 3519 9816", "01872 465067", "020 3519 9325", "07491 786550",
-      "020 3519 2748", "0247 7411008", "01442935082", "0203 6700435",
-      "01726 420021", "01904 378049", "020 3519 9193", "01784 656042",
-      "01392 243076", "020 3677 0465", "0203 5193564"
-    ];
-
-    const clean = matches.find(m => !blocklist.includes(m));
-
-    if (!clean) {
-      throw new Error('Phone number not found or all matches are blocked');
-    }
-
-    await browser.close();
-    return { phone: clean, screenshot: screenshotBase64 };
-
-  } catch (error) {
-    const screenshotBuffer = await page.screenshot({ fullPage: true });
-    const screenshotBase64 = screenshotBuffer.toString('base64');
-    await browser.close();
-    await sendErrorToWebhook(error, `Failed to extract contact from URL: ${url}`, screenshotBase64);
-    throw error;
-  }
-}
+const extractPhoneNumber = (text) => {
+  const phoneRegex = /\b(?:0|\+44)\s?(?:\d\s?){9,10}\b/g;
+  const matches = text.match(phoneRegex)?.map(num => num.replace(/\D/g, '')) || [];
+  return matches.find(num => !EXCLUDED_NUMBERS.has(num));
+};
 
 app.post('/run-task', async (req, res) => {
   const { task, url } = req.body;
+  if (task !== 'extract-contact' || !url) return res.status(400).json({ success: false, error: 'Invalid task or URL' });
 
+  const browser = await chromium.launch();
+  const page = await browser.newPage();
   try {
-    if (task === 'extract-contact') {
-      const result = await extractContact(url);
-      await axios.post(WEBHOOK_URL, result);
-      return res.status(200).json({ success: true });
-    }
+    await page.goto(url, { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(2000); // allow lazy-loading if any
 
-    return res.status(400).json({ error: `Unsupported task: ${task}` });
+    const bodyText = await page.textContent('body');
+    const phone = extractPhoneNumber(bodyText);
 
+    const screenshotPath = '/tmp/screenshot.png';
+    await page.screenshot({ path: screenshotPath, fullPage: true });
+    const buffer = await fs.readFile(screenshotPath);
+    const base64Image = buffer.toString('base64');
+
+    res.json({ success: true, phone: phone || null, screenshot: `data:image/png;base64,${base64Image}` });
   } catch (error) {
-    return res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, error: error.message });
+  } finally {
+    await browser.close();
   }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(8080, () => console.log('🚀 Server running on port 8080'));
