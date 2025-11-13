@@ -1,67 +1,88 @@
-import express from "express";
-import playwright from "playwright";
-import fs from "fs/promises";
+const express = require('express');
+const { chromium } = require('playwright');
+const dotenv = require('dotenv');
+const axios = require('axios');
+const fs = require('fs');
+dotenv.config();
 
 const app = express();
 app.use(express.json());
 
-const EXCLUDED_NUMBERS = [
-  "02035199816", "01872465067", "02035199325", "07491786550", "02035192748",
-  "02477411008", "01442935082", "02036700435", "01726420021", "01904378049",
-  "02035199193", "01784656042", "01392243076", "02036770465", "02035193564"
-];
+const WEBHOOK_URL = 'https://hook.eu2.make.com/53k63zyavw86zmgpf50ilu864ul4zr0b';
 
-function normalizeNumber(number) {
-  return number.replace(/\D/g, ""); // remove non-digits
-}
-
-function isExcluded(number) {
-  const normalized = normalizeNumber(number);
-  return EXCLUDED_NUMBERS.includes(normalized);
-}
-
-function extractPhoneNumbers(text) {
-  const regex = /(?:\+44\s?7\d{3}|\(?0\d{2,4}\)?)\s?\d{3,4}\s?\d{3,4}/g;
-  return (text.match(regex) || []).map(num => num.trim());
-}
-
-app.post("/run-task", async (req, res) => {
-  const { task, url } = req.body;
-  if (task !== "extract-contact" || !url) {
-    return res.status(400).json({ success: false, error: "Invalid input." });
+async function sendErrorToWebhook(error, context = '', screenshot = null) {
+  try {
+    const payload = {
+      timestamp: new Date().toISOString(),
+      message: error.message,
+      stack: error.stack,
+      context,
+    };
+    if (screenshot) {
+      payload.screenshot = screenshot;
+    }
+    await axios.post(WEBHOOK_URL, payload);
+  } catch (err) {
+    console.error('Failed to send error to webhook:', err.message);
   }
+}
 
-  const browser = await playwright.chromium.launch({ headless: true });
-  const context = await browser.newContext({
-    storageState: "./google-state.json"
-  });
+async function extractContact(url) {
+  const browser = await chromium.launch({ headless: true });
+  const context = await browser.newContext();
   const page = await context.newPage();
 
   try {
-    console.log(`🔍 Extracting contact from: ${url}`);
-    await page.goto(url, { waitUntil: "load", timeout: 60000 });
-    await page.waitForTimeout(2000); // let dynamic scripts render
+    await page.goto(url, { timeout: 60000 });
+
+    const screenshotBuffer = await page.screenshot({ fullPage: true });
+    const screenshotBase64 = screenshotBuffer.toString('base64');
 
     const content = await page.content();
+    const phoneRegex = /\b(?:\+44\s?\d{4}|0\d{4}|0\d{3})\s?\d{3}\s?\d{3}\b/g;
+    const matches = content.match(phoneRegex) || [];
 
-    const foundNumbers = extractPhoneNumbers(content);
-    const validNumbers = foundNumbers.filter(num => !isExcluded(num));
+    const blocklist = [
+      "020 3519 9816", "01872 465067", "020 3519 9325", "07491 786550",
+      "020 3519 2748", "0247 7411008", "01442935082", "0203 6700435",
+      "01726 420021", "01904 378049", "020 3519 9193", "01784 656042",
+      "01392 243076", "020 3677 0465", "0203 5193564"
+    ];
 
-    if (validNumbers.length > 0) {
-      const phone = validNumbers[0];
-      console.log(`📞 Valid phone found: ${phone}`);
-      return res.json({ success: true, phone });
-    } else {
-      console.error("❌ No valid phone number found.");
-      return res.json({ success: false, error: "Phone number not found or excluded." });
+    const clean = matches.find(m => !blocklist.includes(m));
+
+    if (!clean) {
+      throw new Error('Phone number not found or all matches are blocked');
     }
-  } catch (error) {
-    console.error("❌ Extraction error:", error.message);
-    res.status(500).json({ success: false, error: error.message });
-  } finally {
+
     await browser.close();
+    return { phone: clean, screenshot: screenshotBase64 };
+
+  } catch (error) {
+    const screenshotBuffer = await page.screenshot({ fullPage: true });
+    const screenshotBase64 = screenshotBuffer.toString('base64');
+    await browser.close();
+    await sendErrorToWebhook(error, `Failed to extract contact from URL: ${url}`, screenshotBase64);
+    throw error;
+  }
+}
+
+app.post('/run-task', async (req, res) => {
+  const { task, url } = req.body;
+
+  try {
+    if (task === 'extract-contact') {
+      const result = await extractContact(url);
+      await axios.post(WEBHOOK_URL, result);
+      return res.status(200).json({ success: true });
+    }
+
+    return res.status(400).json({ error: `Unsupported task: ${task}` });
+
+  } catch (error) {
+    return res.status(500).json({ success: false, error: error.message });
   }
 });
 
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
