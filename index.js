@@ -41,16 +41,19 @@ async function extractContact(url) {
 
   try {
     await page.goto(url, { timeout: 60000 });
+    await page.waitForLoadState('networkidle');
 
-    const content = await page.content();
-    const number = await page.evaluate(() => {
-      const span = [...document.querySelectorAll('span')]
-        .find(el => /\d{5}\s?\d{6}/.test(el.textContent));
-      return span ? span.textContent.trim() : null;
-    });
+    // Try to wait for phone number UI to appear
+    await page.waitForTimeout(1000);
+
+    const fullText = await page.evaluate(() => document.body.innerText);
+    console.log("🧾 Full page text:", fullText);
+
+    const match = fullText.match(/\b(?:\+44\s?\d{4,5}\s?\d{5,6}|07\d{9}|01\d{9}|02\d{9})\b/);
+    const number = match ? match[0] : null;
 
     if (!number) {
-      throw new Error('Phone number not found on the page');
+      throw new Error('Phone number not found in page text');
     }
 
     await browser.close();
@@ -64,25 +67,24 @@ async function extractContact(url) {
 }
 
 app.post('/run-task', async (req, res) => {
-  console.log('📩 /run-task received:', JSON.stringify(req.body, null, 2));
   const { task, url } = req.body;
+  console.log('📩 /run-task received:', JSON.stringify(req.body, null, 2));
 
   try {
-    if (task === 'extract-contact' && url) {
-      console.log(`✅ Starting extract-contact for URL: ${url}`);
-
-      const number = await extractContact(url);
-
-      res.status(200).json({ success: true, phone: number });
-    } else {
-      throw new Error('❌ Invalid task or missing URL');
+    if (task === 'extract-contact') {
+      console.log(`🔍 Extracting contact from: ${url}`);
+      const result = await extractContact(url);
+      return res.status(200).json({ success: true, phone: result });
     }
-  } catch (err) {
-    console.error('🔥 Error in /run-task:', err);
-    await sendErrorToWebhook(err, '/run-task failure');
-    res.status(500).json({ success: false, error: err.message });
+
+    throw new Error('❌ Invalid task or missing URL');
+
+  } catch (error) {
+    console.error('🔥 Error in /run-task:', error.message);
+    await sendErrorToWebhook(error, 'run-task');
+    return res.status(500).json({ success: false, error: error.message });
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
