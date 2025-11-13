@@ -1,21 +1,13 @@
 {
   "name": "playwright-server",
   "version": "1.0.0",
-  "description": "",
+  "type": "module",
   "main": "index.js",
-  "license": "MIT",
-  "engines": {
-    "node": ">=18"
-  },
   "scripts": {
-    "start": "node index.js",
-    "test": "echo \"No tests specified\" && exit 0"
+    "start": "node index.js"
   },
   "dependencies": {
-    "axios": "^1.12.2",
-    "dotenv": "^17.2.3",
-    "express": "^5.1.0",
-    "nodemailer": "^7.0.10",
-    "playwright": "^1.56.1"
+    "express": "^4.18.2",
+    "playwright": "^1.44.1"
   }
 }
