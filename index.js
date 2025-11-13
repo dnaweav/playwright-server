@@ -14,14 +14,16 @@ const express = require('express');
 const { chromium } = require('playwright');
 const dotenv = require('dotenv');
 const axios = require('axios');
+const path = require('path');
 const fs = require('fs');
+
 dotenv.config();
 
 const app = express();
 app.use(express.json());
 
 const WEBHOOK_URL = process.env.WEBHOOK_URL || 'https://hook.eu2.make.com/53k63zyavw86zmgpf50ilu864ul4zr0b';
-const GOOGLE_STATE_PATH = './google-state.json';
+const GOOGLE_STATE_PATH = path.resolve(__dirname, 'google-state.json');
 
 async function sendErrorToWebhook(error, context = '') {
   try {
@@ -32,7 +34,7 @@ async function sendErrorToWebhook(error, context = '') {
       context,
     });
   } catch (err) {
-    console.error('❌ Failed to send error to webhook:', err.message);
+    console.error('Failed to send error to webhook:', err.message);
   }
 }
 
@@ -40,7 +42,7 @@ async function extractContact(url) {
   const browser = await chromium.launch({ headless: true });
 
   const context = await browser.newContext({
-    storageState: GOOGLE_STATE_PATH
+    storageState: GOOGLE_STATE_PATH,
   });
 
   const page = await context.newPage();
@@ -48,6 +50,9 @@ async function extractContact(url) {
   try {
     console.log(`🔍 Extracting contact from: ${url}`);
     await page.goto(url, { timeout: 60000 });
+
+    const pageTitle = await page.title();
+    console.log(`📄 Page title: ${pageTitle}`);
 
     const number = await page.evaluate(() => {
       const span = [...document.querySelectorAll('span')]
@@ -59,6 +64,7 @@ async function extractContact(url) {
       throw new Error('📵 Phone number not found on the page');
     }
 
+    console.log(`📞 Found number: ${number}`);
     await browser.close();
     return number;
 
@@ -71,19 +77,19 @@ async function extractContact(url) {
 
 app.post('/run-task', async (req, res) => {
   const { task, url } = req.body;
-  console.log('📩 /run-task received:', { task, url });
+  console.log('📩 /run-task received:', JSON.stringify(req.body, null, 2));
 
   try {
-    if (task === 'extract-contact') {
+    if (task === 'extract-contact' && url) {
       const result = await extractContact(url);
       return res.status(200).json({ success: true, phone: result });
     }
 
-    throw new Error(`Unsupported task: ${task}`);
+    return res.status(400).json({ error: `Unsupported task or missing URL` });
 
   } catch (error) {
     console.error('🔥 Error in /run-task:', error);
-    await sendErrorToWebhook(error, `run-task`);
+    await sendErrorToWebhook(error, 'run-task');
     return res.status(500).json({ success: false, error: error.message });
   }
 });
