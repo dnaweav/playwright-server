@@ -14,12 +14,14 @@ const express = require('express');
 const { chromium } = require('playwright');
 const dotenv = require('dotenv');
 const axios = require('axios');
+const path = require('path');
 dotenv.config();
 
 const app = express();
 app.use(express.json());
 
 const WEBHOOK_URL = 'https://hook.eu2.make.com/53k63zyavw86zmgpf50ilu864ul4zr0b';
+const GOOGLE_STATE_PATH = path.join(__dirname, 'google-state.json');
 
 async function sendErrorToWebhook(error, context = '') {
   try {
@@ -36,27 +38,31 @@ async function sendErrorToWebhook(error, context = '') {
 
 async function extractContact(url) {
   const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext();
+  const context = await browser.newContext({ storageState: GOOGLE_STATE_PATH });
   const page = await context.newPage();
 
   try {
+    console.log(`🔍 Extracting contact from: ${url}`);
     await page.goto(url, { timeout: 60000 });
-    await page.waitForLoadState('networkidle');
 
-    // Try to wait for phone number UI to appear
-    await page.waitForTimeout(1000);
-
-    const fullText = await page.evaluate(() => document.body.innerText);
-    console.log("🧾 Full page text:", fullText);
-
-    const match = fullText.match(/\b(?:\+44\s?\d{4,5}\s?\d{5,6}|07\d{9}|01\d{9}|02\d{9})\b/);
-    const number = match ? match[0] : null;
-
-    if (!number) {
-      throw new Error('Phone number not found in page text');
+    const fullText = await page.textContent('body');
+    if (fullText?.includes('Sign in') || fullText?.includes('Use your Google Account')) {
+      throw new Error('Redirected to login page — login session likely expired.');
     }
 
+    const number = await page.evaluate(() => {
+      const match = [...document.querySelectorAll('span, div, p')]
+        .map(el => el.textContent)
+        .find(text => /\d{5}\s?\d{6}/.test(text));
+      return match ? match.trim() : null;
+    });
+
     await browser.close();
+
+    if (!number) {
+      throw new Error('Phone number not found on the page.');
+    }
+
     return number;
 
   } catch (error) {
@@ -71,17 +77,15 @@ app.post('/run-task', async (req, res) => {
   console.log('📩 /run-task received:', JSON.stringify(req.body, null, 2));
 
   try {
-    if (task === 'extract-contact') {
-      console.log(`🔍 Extracting contact from: ${url}`);
+    if (task === 'extract-contact' && url) {
       const result = await extractContact(url);
       return res.status(200).json({ success: true, phone: result });
     }
 
-    throw new Error('❌ Invalid task or missing URL');
+    return res.status(400).json({ error: `Unsupported task: ${task}` });
 
   } catch (error) {
-    console.error('🔥 Error in /run-task:', error.message);
-    await sendErrorToWebhook(error, 'run-task');
+    await sendErrorToWebhook(error, `Failed /run-task with task: ${task}`);
     return res.status(500).json({ success: false, error: error.message });
   }
 });
