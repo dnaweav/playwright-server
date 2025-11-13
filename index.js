@@ -43,7 +43,6 @@ async function extractContact(url) {
     await page.goto(url, { timeout: 60000 });
 
     const content = await page.content();
-
     const number = await page.evaluate(() => {
       const span = [...document.querySelectorAll('span')]
         .find(el => /\d{5}\s?\d{6}/.test(el.textContent));
@@ -64,7 +63,6 @@ async function extractContact(url) {
   }
 }
 
-// ✅ SINGLE route that does logging, task execution, and webhook error handling
 app.post('/run-task', async (req, res) => {
   console.log('📩 /run-task received:', JSON.stringify(req.body, null, 2));
   const { task, url } = req.body;
@@ -72,19 +70,19 @@ app.post('/run-task', async (req, res) => {
   try {
     if (task === 'extract-contact' && url) {
       console.log(`✅ Starting extract-contact for URL: ${url}`);
-      const phone = await extractContact(url);
-      console.log(`📞 Extracted phone number: ${phone}`);
-      return res.status(200).json({ success: true, phone });
+
+      const number = await extractContact(url);
+
+      res.status(200).json({ success: true, phone: number });
+    } else {
+      throw new Error('❌ Invalid task or missing URL');
     }
-
-    return res.status(400).json({ error: `Unsupported task or missing URL` });
-
-  } catch (error) {
-    console.error('🔥 Error in /run-task:', error);
-    await sendErrorToWebhook(error, `Failed /run-task with task: ${task}`);
-    return res.status(500).json({ success: false, error: error.message });
+  } catch (err) {
+    console.error('🔥 Error in /run-task:', err);
+    await sendErrorToWebhook(err, '/run-task failure');
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
