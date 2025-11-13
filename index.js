@@ -1,3 +1,15 @@
+console.log("🚀 Server is starting...");
+
+process.on('uncaughtException', err => {
+  console.error("💥 Uncaught Exception:", err);
+  sendErrorToWebhook(err, 'Uncaught Exception');
+});
+
+process.on('unhandledRejection', err => {
+  console.error("❌ Unhandled Rejection:", err);
+  sendErrorToWebhook(err, 'Unhandled Rejection');
+});
+
 const express = require('express');
 const { chromium } = require('playwright');
 const dotenv = require('dotenv');
