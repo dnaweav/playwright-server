@@ -1,98 +1,53 @@
-console.log("🚀 Server is starting...");
-
-process.on('uncaughtException', err => {
-  console.error("💥 Uncaught Exception:", err);
-  sendErrorToWebhook(err, 'Uncaught Exception');
-});
-
-process.on('unhandledRejection', err => {
-  console.error("❌ Unhandled Rejection:", err);
-  sendErrorToWebhook(err, 'Unhandled Rejection');
-});
-
-const express = require('express');
-const { chromium } = require('playwright');
-const dotenv = require('dotenv');
-const axios = require('axios');
-const path = require('path');
-const fs = require('fs');
-
-dotenv.config();
+const express = require("express");
+const bodyParser = require("body-parser");
+const { chromium } = require("playwright");
+const fs = require("fs");
 
 const app = express();
-app.use(express.json());
+const PORT = process.env.PORT || 8080;
 
-const WEBHOOK_URL = process.env.WEBHOOK_URL || 'https://hook.eu2.make.com/53k63zyavw86zmgpf50ilu864ul4zr0b';
-const GOOGLE_STATE_PATH = path.resolve(__dirname, 'google-state.json');
+app.use(bodyParser.json());
 
-async function sendErrorToWebhook(error, context = '') {
-  try {
-    await axios.post(WEBHOOK_URL, {
-      timestamp: new Date().toISOString(),
-      message: error.message,
-      stack: error.stack,
-      context,
-    });
-  } catch (err) {
-    console.error('Failed to send error to webhook:', err.message);
-  }
-}
-
-async function extractContact(url) {
-  const browser = await chromium.launch({ headless: true });
-
-  const context = await browser.newContext({
-    storageState: GOOGLE_STATE_PATH,
-  });
-
-  const page = await context.newPage();
-
-  try {
-    console.log(`🔍 Extracting contact from: ${url}`);
-    await page.goto(url, { timeout: 60000 });
-
-    const pageTitle = await page.title();
-    console.log(`📄 Page title: ${pageTitle}`);
-
-    const number = await page.evaluate(() => {
-      const span = [...document.querySelectorAll('span')]
-        .find(el => /\d{5}\s?\d{6}/.test(el.textContent));
-      return span ? span.textContent.trim() : null;
-    });
-
-    if (!number) {
-      throw new Error('📵 Phone number not found on the page');
-    }
-
-    console.log(`📞 Found number: ${number}`);
-    await browser.close();
-    return number;
-
-  } catch (error) {
-    await browser.close();
-    await sendErrorToWebhook(error, `Failed to extract contact from URL: ${url}`);
-    throw error;
-  }
-}
-
-app.post('/run-task', async (req, res) => {
+app.post("/run-task", async (req, res) => {
   const { task, url } = req.body;
-  console.log('📩 /run-task received:', JSON.stringify(req.body, null, 2));
+
+  if (task !== "extract-contact" || !url) {
+    return res.status(400).json({ error: "Invalid task or missing URL." });
+  }
 
   try {
-    if (task === 'extract-contact' && url) {
-      const result = await extractContact(url);
-      return res.status(200).json({ success: true, phone: result });
+    console.log("🧠 Task: extract-contact");
+    console.log("🔗 URL:", url);
+
+    const browser = await chromium.launch({ headless: true });
+    const context = await browser.newContext({
+      storageState: "./google-state.json", // <-- Load session
+    });
+
+    const page = await context.newPage();
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
+
+    const title = await page.title();
+    console.log("📝 Page title:", title);
+
+    const pageContent = await page.content();
+    const phoneMatch = pageContent.match(/(\+?\d{1,3}[-.\s]?)?\(?\d{2,4}\)?[-.\s]?\d{3,5}[-.\s]?\d{4}/);
+
+    if (phoneMatch) {
+      console.log("✅ Found phone:", phoneMatch[0]);
+      res.json({ success: true, phone: phoneMatch[0] });
+    } else {
+      console.log("❌ No phone number found.");
+      res.json({ success: false, message: "No phone number found." });
     }
 
-    return res.status(400).json({ error: `Unsupported task or missing URL` });
-
+    await browser.close();
   } catch (error) {
-    console.error('🔥 Error in /run-task:', error);
-    await sendErrorToWebhook(error, 'run-task');
-    return res.status(500).json({ success: false, error: error.message });
+    console.error("❌ Error:", error);
+    res.status(500).json({ error: "Internal Server Error", details: error.message });
   }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+});
