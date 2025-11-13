@@ -23,11 +23,14 @@ app.post("/run-task", async (req, res) => {
       const title = await page.title();
       console.log("📄 Page title:", title);
 
-      // New: extract phone number from the top blue header
+      // More robust: Search all spans for UK phone number pattern
       const phone = await page.evaluate(() => {
-        const header = document.querySelector("header h1")?.textContent || "";
-        const match = header.match(/\b\d{5}\s?\d{6}\b/);
-        return match ? match[0].replace(/\s/g, "") : null;
+        const spans = Array.from(document.querySelectorAll("span"));
+        for (const span of spans) {
+          const match = span.textContent.match(/\b07\d{9}\b/); // UK mobile format
+          if (match) return match[0];
+        }
+        return null;
       });
 
       if (phone) {
