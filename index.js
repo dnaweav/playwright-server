@@ -83,3 +83,34 @@ app.post('/run-task', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
+app.post('/run-task', async (req, res) => {
+  console.log('📩 /run-task received:', JSON.stringify(req.body, null, 2));
+
+  try {
+    // Example task to test execution
+    const { task, url } = req.body;
+
+    if (task === 'extract-contact' && url) {
+      console.log(`✅ Starting extract-contact for URL: ${url}`);
+
+      // Run basic browser test to confirm things are wired
+      const browser = await chromium.launch();
+      const page = await browser.newPage();
+      await page.goto(url);
+      const title = await page.title();
+      await browser.close();
+
+      console.log(`📝 Page title is: ${title}`);
+
+      res.status(200).json({ success: true, title });
+    } else {
+      throw new Error('❌ Invalid task or missing URL');
+    }
+
+  } catch (err) {
+    console.error('🔥 Error in /run-task:', err);
+    await sendErrorToWebhook(err, 'run-task');
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
